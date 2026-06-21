@@ -1008,8 +1008,33 @@ def sample_live_incidents(limit: int = 15) -> list:
         pool = df
     # Prioritise high-priority / closure-causing historical events — these are
     # the ones genuinely worth surfacing as "active-style" incidents.
-    pool = pool.sort_values(["is_high_priority", "requires_road_closure"], ascending=False)
-    sample = pool.head(limit * 3).sample(n=min(limit, len(pool)), random_state=now.hour * 60 + now.minute // 5)
+    # Sample diversely: stratify by event_cause so the map shows a realistic
+    # mix of incident types, not just the top-ranked high-priority rows.
+    rng_seed = now.hour * 60 + now.minute // 5
+    causes = pool["event_cause"].dropna().unique()
+    per_cause = max(1, limit // max(len(causes), 1))
+    frames = []
+    for cause in causes:
+        chunk = pool[pool["event_cause"] == cause]
+        n = min(per_cause, len(chunk))
+        frames.append(chunk.sample(n=n, random_state=rng_seed))
+    diverse_pool = pd.concat(frames) if frames else pool
+    # Top up to `limit` from remaining pool if under-sampled
+    if len(diverse_pool) < limit:
+        remaining = pool[~pool.index.isin(diverse_pool.index)]
+        top_up = remaining.sample(n=min(limit - len(diverse_pool), len(remaining)), random_state=rng_seed)
+        diverse_pool = pd.concat([diverse_pool, top_up])
+    sample = diverse_pool.sample(n=min(limit, len(diverse_pool)), random_state=rng_seed)
+
+    # Pre-compute per-cause median duration from valid historical rows.
+    # This gives realistic, cause-specific delay baselines grounded in real data.
+    cause_median = (
+        df[df["duration_min"].notna()]
+        .groupby("event_cause")["duration_min"]
+        .median()
+        .to_dict()
+    )
+    global_median = float(df["duration_min"].median()) if df["duration_min"].notna().any() else 45.0
 
     out = []
     for _, r in sample.iterrows():
@@ -1022,15 +1047,27 @@ def sample_live_incidents(limit: int = 15) -> list:
         if models:
             congestion = float(models["gbr"].predict(x_row)[0]) * 0.6 + float(models["rfr"].predict(x_row)[0]) * 0.4
             closure_p  = float(models["gbc"].predict_proba(x_row)[0][1])
-            # Use the trained gbr_delay model for realistic per-incident delays
-            # (gbr_delay was fit on duration_min * 0.35, so inverse-scale back to minutes)
-            delay_min_pred = float(models["gbr_delay"].predict(x_row)[0]) / 0.35
-            delay_sec = int(np.clip(delay_min_pred * 60, 60, 2700))
         else:
             congestion, closure_p = 40.0, 0.2
-            delay_sec = 600  # 10-min fallback when no models loaded
+
         magnitude = 4 if congestion >= 70 else 3 if congestion >= 50 else 2 if congestion >= 30 else 1
         severity  = {1: "Minor", 2: "Moderate", 3: "Major", 4: "Critical"}[magnitude]
+
+        # --- Delay calculation ---
+        # Priority 1: use the actual historical duration_min from this matched row.
+        # Priority 2: fall back to the per-cause median from all valid rows.
+        # Priority 3: global dataset median.
+        # Scale by congestion so busier-hour incidents show a higher delay,
+        # but keep the variation driven by real data rather than a fixed multiplier.
+        if pd.notna(r.get("duration_min")) and r["duration_min"] > 0:
+            base_delay_min = float(r["duration_min"])
+        else:
+            base_delay_min = cause_median.get(r.get("event_cause"), global_median)
+
+        # Congestion ratio: baseline is 40 (moderate); scale ±50% around that.
+        congestion_scale = np.clip(congestion / 40.0, 0.5, 2.5)
+        delay_min = base_delay_min * congestion_scale
+        delay_sec = int(np.clip(delay_min * 60, 60, 5400))  # 1 min – 90 min cap
 
         out.append({
             "id": f"hist-{r['id']}",
