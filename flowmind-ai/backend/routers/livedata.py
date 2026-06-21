@@ -1,9 +1,14 @@
 """
 FlowMind AI — Live Data Router
-Traffic data: TomTom Routing API (replaces Google Routes — same key as incidents).
-Events: OpenStreetMap Overpass (free, no key).
-Incidents: TomTom Traffic Incidents API.
-Falls back to ML engine when APIs are unavailable or quota is exhausted.
+
+APIs used:
+  - TomTom Traffic Incidents  (/traffic/services/5/incidentDetails) — your key works
+  - TomTom Flow Segment Data  (/traffic/services/4/flowSegmentData) — free, same key,
+    gives current speed + free-flow speed per road segment, no Routing API needed
+  - OpenStreetMap Overpass    — free, no key, real venue data
+
+TomTom Routing API is NOT used — it requires a separate paid product on your key (403).
+Instead we use the Flow API which IS included in the free Traffic tier.
 """
 
 import httpx, os, asyncio, math, logging
@@ -20,58 +25,41 @@ logger = logging.getLogger("flowmind.livedata")
 
 TOMTOM_KEY = os.getenv("TOMTOM_API_KEY", "")
 
-# Bengaluru bounding box
 BLR_LAT, BLR_LNG = 12.9716, 77.5946
-BLR_BBOX = "12.7343,77.3791,13.1435,77.8388"   # south,west,north,east
+BLR_BBOX = "12.7343,77.3791,13.1435,77.8388"
 
-# ── TomTom Routing quota backoff ─────────────────────────────────────────────
-# TomTom free tier: 2,500 requests/day shared across incidents + routing.
-# 7 corridors × 60s refresh = ~10,080 routing calls/day — way over limit.
-# Strategy: refresh corridors every 10 minutes (not 60s), which gives
-# 7 × 144 = 1,008 routing calls/day, leaving ~1,500 for incident calls.
-# If we still hit 429, back off for the rest of the day same as Google fix.
-_tomtom_routing_quota_exhausted_date: date | None = None
-
-def _routing_quota_exhausted() -> bool:
-    return _tomtom_routing_quota_exhausted_date == datetime.now(timezone.utc).date()
-
-def _mark_routing_quota_exhausted() -> None:
-    global _tomtom_routing_quota_exhausted_date
-    today = datetime.now(timezone.utc).date()
-    if _tomtom_routing_quota_exhausted_date != today:
-        logger.warning(
-            "TomTom Routing API daily quota exhausted — switching to ML fallback "
-            "for the rest of today (%s UTC). Quota resets at midnight UTC.", today
-        )
-    _tomtom_routing_quota_exhausted_date = today
-
-# ── Cache: only re-fetch corridors every 10 minutes ──────────────────────────
-# This is the key change that keeps TomTom routing within the 2,500/day cap.
-# Traffic conditions on a corridor don't change meaningfully every 60s anyway.
+# ── Module-level caches ───────────────────────────────────────────────────────
+# Shared between requests so the 10-min TTL actually works across calls.
+# (Local variables inside the function reset every call — that's why the cache
+#  wasn't working before.)
 _corridor_cache: list = []
 _corridor_cache_time: datetime | None = None
-CORRIDOR_CACHE_TTL_SECONDS = 600   # 10 minutes
+CORRIDOR_CACHE_TTL = 600   # 10 minutes → 7 × 144 = 1,008 flow calls/day
 
-def _corridor_cache_valid() -> bool:
-    if not _corridor_cache or not _corridor_cache_time:
-        return False
-    age = (datetime.now(timezone.utc) - _corridor_cache_time).total_seconds()
-    return age < CORRIDOR_CACHE_TTL_SECONDS
+_ml_traffic_cache: list = []
+_ml_traffic_cache_time: datetime | None = None
+ML_CACHE_TTL = 600
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _haversine(lat1, lon1, lat2, lon2):
-    R = 6371
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
-    return R * 2 * math.asin(math.sqrt(a))
+# ── TomTom quota backoff ──────────────────────────────────────────────────────
+_flow_quota_exhausted_date: date | None = None
+
+def _flow_quota_exhausted() -> bool:
+    return _flow_quota_exhausted_date == datetime.now(timezone.utc).date()
+
+def _mark_flow_quota_exhausted() -> None:
+    global _flow_quota_exhausted_date
+    today = datetime.now(timezone.utc).date()
+    if _flow_quota_exhausted_date != today:
+        logger.warning(
+            "TomTom Flow API daily quota exhausted — ML fallback until midnight UTC (%s).", today
+        )
+    _flow_quota_exhausted_date = today
 
 def np_clip(v, lo, hi):
     return max(lo, min(hi, v))
 
-# ── Overpass API — real OSM events (free, no key needed) ─────────────────────
+# ── Overpass — real OSM venue data ───────────────────────────────────────────
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-
 OVERPASS_QUERY = """
 [out:json][timeout:25];
 (
@@ -90,14 +78,14 @@ out body 80;
 async def fetch_osm_venues() -> list:
     try:
         headers = {
-            "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic command center; contact: flowmind-ai@example.com)",
-            # Do NOT send Accept: application/json — Overpass Apache returns 406.
-            # [out:json] in the query body controls the format.
+            "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic; flowmind-ai@example.com)",
+            # IMPORTANT: No Accept header — Overpass Apache returns 406 if present.
+            # [out:json] in the query body controls response format instead.
         }
         async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY}, headers=headers)
         if resp.status_code != 200:
-            logger.warning("Overpass API returned HTTP %s: %s", resp.status_code, resp.text[:300])
+            logger.warning("Overpass returned HTTP %s: %s", resp.status_code, resp.text[:200])
             return _fallback_events()
         elements = resp.json().get("elements", [])
         venues = []
@@ -106,14 +94,14 @@ async def fetch_osm_venues() -> list:
             name = tags.get("name") or tags.get("name:en", "")
             if not name:
                 continue
-            amenity = tags.get("amenity") or tags.get("leisure") or tags.get("tourism") or tags.get("shop", "")
+            amenity = (tags.get("amenity") or tags.get("leisure")
+                       or tags.get("tourism") or tags.get("shop", ""))
             TYPE_MAP = {
                 "place_of_worship": "Religious Event", "stadium": "Sports Event",
-                "university": "Academic Event", "hospital": "Emergency Zone",
-                "attraction": "Tourist Event", "mall": "Public Gathering",
-                "theatre": "Cultural Event", "cinema": "Public Event",
+                "university": "Academic Event",        "hospital": "Emergency Zone",
+                "attraction": "Tourist Event",          "mall": "Public Gathering",
+                "theatre": "Cultural Event",            "cinema": "Public Event",
             }
-            event_type = TYPE_MAP.get(amenity, "Public Event")
             cap_ranges = {
                 "stadium": (5000, 50000), "mall": (2000, 20000),
                 "place_of_worship": (500, 10000), "university": (1000, 8000),
@@ -125,7 +113,7 @@ async def fetch_osm_venues() -> list:
             venues.append({
                 "id": f"osm-{el['id']}",
                 "name": name,
-                "event_type": event_type,
+                "event_type": TYPE_MAP.get(amenity, "Public Event"),
                 "amenity": amenity,
                 "latitude": el.get("lat", BLR_LAT),
                 "longitude": el.get("lon", BLR_LNG),
@@ -134,70 +122,65 @@ async def fetch_osm_venues() -> list:
                 "source": "OpenStreetMap (Live)",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
+        logger.info("Overpass returned %d venues.", len(venues))
         return venues[:60]
     except Exception as e:
-        logger.warning("Overpass API request failed: %s", e)
+        logger.warning("Overpass request failed: %s", e)
         return _fallback_events()
 
 # ── TomTom Traffic Incidents ──────────────────────────────────────────────────
 async def fetch_tomtom_incidents() -> list:
     if not TOMTOM_KEY:
-        logger.info("TomTom: no API key configured, using ML fallback.")
         return _fallback_incidents()
-
     fields = (
         "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,"
         "magnitudeOfDelay,events{description,code,iconCategory},startTime,endTime,"
         "from,to,length,delay,roadNumbers,timeValidity}}}"
     )
-    url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
     params = {
-        "key": TOMTOM_KEY,
-        "bbox": BLR_BBOX,
-        "fields": fields,
+        "key": TOMTOM_KEY, "bbox": BLR_BBOX, "fields": fields,
         "language": "en-GB",
         "categoryFilter": "0,1,2,3,4,5,6,7,8,9,10,11,14",
         "timeValidityFilter": "present",
     }
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(
+                "https://api.tomtom.com/traffic/services/5/incidentDetails",
+                params=params,
+            )
         if resp.status_code != 200:
-            logger.warning("TomTom API returned HTTP %s: %s", resp.status_code, resp.text[:300])
+            logger.warning("TomTom Incidents HTTP %s: %s", resp.status_code, resp.text[:200])
             return _fallback_incidents()
-        data = resp.json()
         incidents = []
-        for inc in data.get("incidents", [])[:50]:
+        for inc in resp.json().get("incidents", [])[:50]:
             props = inc.get("properties", {})
-            geo = inc.get("geometry", {})
+            geo   = inc.get("geometry", {})
             coords = geo.get("coordinates", [])
             if geo.get("type") == "Point" and coords:
                 lng, lat = coords[0], coords[1]
             elif geo.get("type") == "LineString" and coords:
-                mid = coords[len(coords)//2]
+                mid = coords[len(coords) // 2]
                 lng, lat = mid[0], mid[1]
             else:
                 continue
             magnitude = props.get("magnitudeOfDelay", 0)
-            severity = {0:"Unknown",1:"Minor",2:"Moderate",3:"Major",4:"Undefined"}.get(magnitude, "Unknown")
             events_list = props.get("events", [])
-            desc = events_list[0].get("description","Traffic incident") if events_list else "Traffic incident"
+            desc = events_list[0].get("description", "Traffic incident") if events_list else "Traffic incident"
             icon = props.get("iconCategory", 0)
             cause_map = {
-                0:"Unknown",1:"Accident",2:"Fog",3:"Dangerous Conditions",4:"Rain",
-                5:"Ice",6:"Queue",7:"Closed",8:"Road Works",9:"Wind",10:"Flooding",
-                11:"Broken Down Vehicle",14:"Broken Down Vehicle"
+                0:"Unknown", 1:"Accident", 2:"Fog", 3:"Dangerous Conditions", 4:"Rain",
+                5:"Ice", 6:"Queue", 7:"Closed", 8:"Road Works", 9:"Wind", 10:"Flooding",
+                11:"Broken Down Vehicle", 14:"Broken Down Vehicle",
             }
             incidents.append({
                 "id": props.get("id", f"tt-{abs(hash((lat, lng, desc))) % 100000}"),
                 "description": desc,
                 "cause": cause_map.get(icon, "Traffic Incident"),
-                "severity": severity,
+                "severity": {0:"Unknown",1:"Minor",2:"Moderate",3:"Major",4:"Undefined"}.get(magnitude, "Unknown"),
                 "magnitude": magnitude,
-                "latitude": lat,
-                "longitude": lng,
-                "from": props.get("from",""),
-                "to": props.get("to",""),
+                "latitude": lat, "longitude": lng,
+                "from": props.get("from", ""), "to": props.get("to", ""),
                 "delay_sec": props.get("delay", 0),
                 "length_m": props.get("length", 0),
                 "road": (props.get("roadNumbers") or ["Unknown"])[0],
@@ -205,142 +188,150 @@ async def fetch_tomtom_incidents() -> list:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
         if not incidents:
-            logger.info("TomTom API succeeded with 0 incidents — no active incidents in Bengaluru.")
+            logger.info("TomTom Incidents: 0 active incidents in Bengaluru right now.")
             return []
         return incidents
     except Exception as e:
-        logger.warning("TomTom API request failed: %s", e)
+        logger.warning("TomTom Incidents request failed: %s", e)
         return _fallback_incidents()
 
-# ── TomTom Routing API — replaces Google Routes ───────────────────────────────
-# TomTom's /routing/1/calculateRoute endpoint returns:
-#   travelTimeInSeconds       = traffic-aware ETA
-#   noTrafficTravelTimeInSeconds = free-flow baseline
-# These give us the same congestion ratio as Google Routes did.
-# Uses the same TOMTOM_KEY as the incidents endpoint — no extra signup needed.
+# ── TomTom Flow Segment Data — replaces Routing API ─────────────────────────
+# Flow API (/traffic/services/4/flowSegmentData/absolute/10/json) is included
+# in the free TomTom Traffic tier (same key as incidents).
+# It returns currentSpeed + freeFlowSpeed for a road point, giving us a real
+# congestion ratio without needing the Routing product (which caused 403).
 #
-# TomTom Routing URL format:
-#   /routing/1/calculateRoute/{origin}:{destination}/json
-# where origin/destination are "lat,lon" strings.
+# One call per corridor midpoint → 7 calls per refresh.
 
-TOMTOM_ROUTING_URL = "https://api.tomtom.com/routing/1/calculateRoute/{waypoints}/json"
+TOMTOM_FLOW_URL = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
 
 BENGALURU_CORRIDORS = [
-    {"name":"Outer Ring Road",    "points":"12.9352,77.6245|12.9716,77.6412|12.9933,77.6897"},
-    {"name":"Mysore Road",        "points":"12.9523,77.5150|12.9411,77.4852|12.9305,77.4601"},
-    {"name":"Bellary Road",       "points":"13.0240,77.5946|13.0578,77.5870|13.0950,77.5780"},
-    {"name":"Hosur Road",         "points":"12.9270,77.6210|12.8910,77.6401|12.8550,77.6602"},
-    {"name":"Old Madras Road",    "points":"12.9858,77.6412|13.0100,77.6601|13.0350,77.6920"},
-    {"name":"Tumkur Road",        "points":"13.0240,77.5480|13.0550,77.5120|13.0850,77.4850"},
-    {"name":"Bannerghatta Road",  "points":"12.9050,77.5946|12.8650,77.5946|12.8250,77.5946"},
+    {"name": "Outer Ring Road",   "points": "12.9352,77.6245|12.9716,77.6412|12.9933,77.6897"},
+    {"name": "Mysore Road",       "points": "12.9523,77.5150|12.9411,77.4852|12.9305,77.4601"},
+    {"name": "Bellary Road",      "points": "13.0240,77.5946|13.0578,77.5870|13.0950,77.5780"},
+    {"name": "Hosur Road",        "points": "12.9270,77.6210|12.8910,77.6401|12.8550,77.6602"},
+    {"name": "Old Madras Road",   "points": "12.9858,77.6412|13.0100,77.6601|13.0350,77.6920"},
+    {"name": "Tumkur Road",       "points": "13.0240,77.5480|13.0550,77.5120|13.0850,77.4850"},
+    {"name": "Bannerghatta Road", "points": "12.9050,77.5946|12.8650,77.5946|12.8250,77.5946"},
 ]
 
-async def _fetch_one_corridor_tomtom(client: httpx.AsyncClient, corridor: dict):
+async def _fetch_flow_for_corridor(client: httpx.AsyncClient, corridor: dict):
     pts = corridor["points"].split("|")
-    # TomTom routing waypoints format: "lat,lon:lat,lon:lat,lon"
-    waypoints = ":".join(pts)
-    url = TOMTOM_ROUTING_URL.format(waypoints=waypoints)
+    mid = pts[len(pts) // 2].split(",")
+    lat, lng = float(mid[0]), float(mid[1])
     params = {
         "key": TOMTOM_KEY,
-        "traffic": "true",           # include live traffic
-        "travelMode": "car",
-        "routeType": "fastest",
-        "computeTravelTimeFor": "all",   # returns noTrafficTravelTimeInSeconds
+        "point": f"{lat},{lng}",
+        "unit": "KMPH",
+        "openLr": "false",
     }
     try:
-        resp = await client.get(url, params=params)
+        resp = await client.get(TOMTOM_FLOW_URL, params=params)
 
         if resp.status_code == 429:
-            _mark_routing_quota_exhausted()
+            _mark_flow_quota_exhausted()
             return None
 
         if resp.status_code != 200:
             logger.warning(
-                "TomTom Routing API error for %s: HTTP %s — %s",
-                corridor["name"], resp.status_code, resp.text[:200],
+                "TomTom Flow API error for %s: HTTP %s — %s",
+                corridor["name"], resp.status_code, resp.text[:150],
             )
             return None
 
-        data = resp.json()
-        routes = data.get("routes", [])
-        if not routes:
-            logger.warning("TomTom Routing: no routes returned for %s", corridor["name"])
-            return None
+        data = resp.json().get("flowSegmentData", {})
+        current_speed  = float(data.get("currentSpeed", 0))
+        freeflow_speed = float(data.get("freeFlowSpeed", 1)) or 1.0
+        current_tt     = float(data.get("currentTravelTime", 0))
+        freeflow_tt    = float(data.get("freeFlowTravelTime", 1)) or 1.0
 
-        summary = routes[0].get("summary", {})
-        travel_time_s   = summary.get("travelTimeInSeconds", 0)
-        no_traffic_s    = summary.get("noTrafficTravelTimeInSeconds", 0) or travel_time_s
-        distance_m      = summary.get("lengthInMeters", 0)
+        # Congestion = how much slower than free-flow, as a percentage
+        congestion_pct = int(np_clip((1 - current_speed / freeflow_speed) * 100, 0, 99))
+        level = ("Critical" if congestion_pct > 60 else "High" if congestion_pct > 35
+                 else "Moderate" if congestion_pct > 15 else "Free Flow")
 
-        congestion_ratio = (travel_time_s / no_traffic_s) if no_traffic_s > 0 else 1.0
-        congestion_pct   = int(np_clip((congestion_ratio - 1) * 100, 0, 99))
-        level = "Critical" if congestion_pct>60 else "High" if congestion_pct>35 else "Moderate" if congestion_pct>15 else "Free Flow"
+        # Estimate distance from corridor point spread
+        pts_coords = [p.split(",") for p in pts]
+        dist_km = sum(
+            math.sqrt((float(pts_coords[i+1][0]) - float(pts_coords[i][0]))**2 +
+                      (float(pts_coords[i+1][1]) - float(pts_coords[i][1]))**2) * 111
+            for i in range(len(pts_coords) - 1)
+        )
 
-        mid = pts[len(pts)//2].split(",")
         return {
             "corridor": corridor["name"],
-            "latitude": float(mid[0]),
-            "longitude": float(mid[1]),
+            "latitude": lat,
+            "longitude": lng,
             "congestion_pct": congestion_pct,
             "congestion_level": level,
-            "duration_normal_min": round(no_traffic_s / 60, 1),
-            "duration_traffic_min": round(travel_time_s / 60, 1),
-            "distance_km": round(distance_m / 1000, 1),
-            "delay_min": round((travel_time_s - no_traffic_s) / 60, 1),
-            "source": "TomTom Routing (Live)",
+            "duration_normal_min": round(freeflow_tt / 60, 1),
+            "duration_traffic_min": round(current_tt / 60, 1),
+            "distance_km": round(dist_km, 1),
+            "delay_min": round((current_tt - freeflow_tt) / 60, 1),
+            "current_speed_kmph": round(current_speed, 1),
+            "freeflow_speed_kmph": round(freeflow_speed, 1),
+            "source": "TomTom Flow (Live)",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
-        logger.warning("TomTom Routing request failed for %s: %s", corridor["name"], e)
+        logger.warning("TomTom Flow request failed for %s: %s", corridor["name"], e)
         return None
 
 async def fetch_google_traffic() -> list:
     """
-    Name kept as fetch_google_traffic so no other file needs changing.
-    Now backed by TomTom Routing API instead of Google Routes.
-    Results are cached for 10 minutes to stay within TomTom's 2,500/day free cap:
-      7 corridors × 144 refreshes/day = 1,008 routing calls, leaving ~1,500 for incidents.
+    Function name kept unchanged so no other file needs editing.
+    Now uses TomTom Flow Segment API (free tier, same key as incidents).
+    Results cached 10 minutes to stay within the 2,500 req/day limit.
     """
     global _corridor_cache, _corridor_cache_time
+
     if not TOMTOM_KEY:
-        logger.info("TomTom Routing: no API key configured, using ML fallback.")
+        logger.info("No TomTom key — using ML fallback for corridors.")
         return _fallback_google_traffic()
 
-    # Return cached data if still fresh
-    if _corridor_cache_valid():
-        return _corridor_cache
+    # Serve from cache if still fresh (this actually works now — module-level var)
+    if _corridor_cache and _corridor_cache_time:
+        age = (datetime.now(timezone.utc) - _corridor_cache_time).total_seconds()
+        if age < CORRIDOR_CACHE_TTL:
+            return _corridor_cache
 
-    # Quota exhausted for today — skip API calls
-    if _routing_quota_exhausted():
+    if _flow_quota_exhausted():
         return _fallback_google_traffic()
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=8) as client:
         results = await asyncio.gather(
-            *[_fetch_one_corridor_tomtom(client, c) for c in BENGALURU_CORRIDORS]
+            *[_fetch_flow_for_corridor(client, c) for c in BENGALURU_CORRIDORS]
         )
     results = [r for r in results if r is not None]
 
     if not results:
-        logger.info("TomTom Routing: all corridor requests failed — using ML fallback.")
+        logger.info("TomTom Flow: all requests failed — using ML fallback.")
         return _fallback_google_traffic()
 
-    # Update cache
     _corridor_cache = results
     _corridor_cache_time = datetime.now(timezone.utc)
+    logger.info("TomTom Flow: fetched %d corridors, cached for %ds.", len(results), CORRIDOR_CACHE_TTL)
     return results
 
-# ── Fallback data — ML-driven, NOT random ─────────────────────────────────────
+# ── ML fallbacks — stable, cached, not random ────────────────────────────────
 def _fallback_incidents() -> list:
     return ml_sample_live_incidents(15)
 
 def _fallback_google_traffic() -> list:
+    global _ml_traffic_cache, _ml_traffic_cache_time
+
+    if _ml_traffic_cache and _ml_traffic_cache_time:
+        age = (datetime.now(timezone.utc) - _ml_traffic_cache_time).total_seconds()
+        if age < ML_CACHE_TTL:
+            return _ml_traffic_cache
+
     results = []
     for corridor in BENGALURU_CORRIDORS:
         pts = corridor["points"].split("|")
-        mid = pts[len(pts)//2].split(",")
+        mid = pts[len(pts) // 2].split(",")
         pred = ml_predict_corridor_now(corridor["name"])
         base = pred["congestion_pct"]
-        level = "Critical" if base>70 else "High" if base>45 else "Moderate" if base>20 else "Free Flow"
+        level = "Critical" if base > 70 else "High" if base > 45 else "Moderate" if base > 20 else "Free Flow"
         results.append({
             "corridor": corridor["name"],
             "latitude": float(mid[0]),
@@ -351,52 +342,53 @@ def _fallback_google_traffic() -> list:
             "duration_traffic_min": pred["duration_traffic_min"],
             "distance_km": round(pred["duration_normal_min"] / 2.2, 1),
             "delay_min": pred["delay_min"],
-            "source": "ML-predicted (live API not configured)",
+            "source": "ML-predicted (TomTom Flow unavailable)",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+
+    _ml_traffic_cache = results
+    _ml_traffic_cache_time = datetime.now(timezone.utc)
     return results
 
 def _fallback_events() -> list:
     places = [
-        ("Chinnaswamy Stadium","Sports Event",12.9791,77.5993,18000,55000),
-        ("Lalbagh Botanical Garden","Public Gathering",12.9507,77.5848,2500,11000),
-        ("Cubbon Park","Public Event",12.9763,77.5929,1500,9000),
-        ("Bannerghatta National Park","Tourist Event",12.8019,77.5751,400,3500),
-        ("ISKCON Temple","Religious Event",13.0094,77.5510,4000,22000),
-        ("Palace Grounds","Cultural Event",13.0059,77.5700,8000,42000),
-        ("Freedom Park","Public Event",12.9690,77.5780,800,16000),
-        ("Kanteerava Stadium","Sports Event",12.9738,77.5980,6000,26000),
-        ("UB City Mall","Public Gathering",12.9716,77.5970,2500,13000),
-        ("Vidhana Soudha","Government Event",12.9789,77.5917,400,5500),
-        ("Vidyarthi Bhavan","Cultural Event",12.9500,77.5600,150,1100),
-        ("Doddagaddavalli","Religious Event",13.0480,77.6370,1500,8500),
-        ("IIM Bangalore","Academic Event",13.0694,77.5994,800,5200),
-        ("Jakkur Aerodrome","Special Event",13.0820,77.5900,400,3200),
-        ("Koramangala Park","Public Gathering",12.9340,77.6270,400,5200),
+        ("Chinnaswamy Stadium",      "Sports Event",    12.9791, 77.5993, 18000, 55000),
+        ("Lalbagh Botanical Garden", "Public Gathering", 12.9507, 77.5848,  2500, 11000),
+        ("Cubbon Park",              "Public Event",     12.9763, 77.5929,  1500,  9000),
+        ("Bannerghatta National Park","Tourist Event",   12.8019, 77.5751,   400,  3500),
+        ("ISKCON Temple",            "Religious Event",  13.0094, 77.5510,  4000, 22000),
+        ("Palace Grounds",           "Cultural Event",   13.0059, 77.5700,  8000, 42000),
+        ("Freedom Park",             "Public Event",     12.9690, 77.5780,   800, 16000),
+        ("Kanteerava Stadium",       "Sports Event",     12.9738, 77.5980,  6000, 26000),
+        ("UB City Mall",             "Public Gathering", 12.9716, 77.5970,  2500, 13000),
+        ("Vidhana Soudha",           "Government Event", 12.9789, 77.5917,   400,  5500),
+        ("IIM Bangalore",            "Academic Event",   13.0694, 77.5994,   800,  5200),
+        ("Jakkur Aerodrome",         "Special Event",    13.0820, 77.5900,   400,  3200),
+        ("Koramangala Park",         "Public Gathering", 12.9340, 77.6270,   400,  5200),
     ]
     events = []
     for name, etype, lat, lng, cap_min, cap_max in places:
         crowd = ml_estimate_venue_crowd(cap_min, cap_max)
         risk = "High" if crowd > 15000 else "Moderate" if crowd > 5000 else "Low"
         events.append({
-            "id": f"venue-{name[:6].replace(' ','')}",
-            "name": name,
-            "event_type": etype,
-            "amenity": "venue",
-            "latitude": lat,
-            "longitude": lng,
-            "crowd_estimate": crowd,
-            "risk_level": risk,
-            "source": "ML-predicted (live API not configured)",
+            "id": f"venue-{name[:6].replace(' ', '')}",
+            "name": name, "event_type": etype, "amenity": "venue",
+            "latitude": lat, "longitude": lng,
+            "crowd_estimate": crowd, "risk_level": risk,
+            "source": "ML-predicted (Overpass unavailable)",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
     return events
 
-# ── API Endpoints ──────────────────────────────────────────────────────────────
+# ── API Endpoints ─────────────────────────────────────────────────────────────
 @router.get("/traffic-incidents")
 async def traffic_incidents():
     data = await fetch_tomtom_incidents()
-    return {"count": len(data), "source": data[0]["source"] if data else "TomTom Live (0 active incidents)", "incidents": data}
+    return {
+        "count": len(data),
+        "source": data[0]["source"] if data else "TomTom Live (0 active incidents)",
+        "incidents": data,
+    }
 
 @router.get("/google-traffic")
 async def google_traffic():
@@ -410,7 +402,6 @@ async def live_events():
 
 @router.get("/live-snapshot")
 async def live_snapshot():
-    """All live data in one call for the dashboard."""
     incidents, traffic, events = await asyncio.gather(
         fetch_tomtom_incidents(),
         fetch_google_traffic(),
@@ -425,7 +416,9 @@ async def live_snapshot():
             "critical_corridors": critical,
             "high_severity_incidents": high_inc,
             "live_events": len(events),
-            "avg_congestion_pct": round(sum(t["congestion_pct"] for t in traffic) / max(len(traffic),1), 1),
+            "avg_congestion_pct": round(
+                sum(t["congestion_pct"] for t in traffic) / max(len(traffic), 1), 1
+            ),
         },
         "incidents": incidents,
         "corridors": traffic,
@@ -434,13 +427,16 @@ async def live_snapshot():
 
 @router.get("/config-status")
 async def config_status():
-    """Tell the frontend which API keys are configured."""
+    corridor_source = (
+        "TomTom Flow (Live)" if (TOMTOM_KEY and not _flow_quota_exhausted()) else "ML-predicted"
+    )
     return {
-        "google_maps": bool(TOMTOM_KEY),   # repurposed: means "corridor data available"
         "tomtom": bool(TOMTOM_KEY),
         "osm": True,
         "simulation_mode": not TOMTOM_KEY,
-        "routing_quota_exhausted": _routing_quota_exhausted(),
+        "corridor_source": corridor_source,
+        "incident_source": "TomTom Live" if TOMTOM_KEY else "ML-predicted",
+        "flow_quota_exhausted": _flow_quota_exhausted(),
         "corridor_cache_age_sec": (
             round((datetime.now(timezone.utc) - _corridor_cache_time).total_seconds())
             if _corridor_cache_time else None

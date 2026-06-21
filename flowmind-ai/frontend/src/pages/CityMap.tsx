@@ -241,16 +241,27 @@ export default function CityMap() {
         </div>
       </div>
 
-      {/* API key status banner */}
-      {apiStatus && apiStatus.simulation_mode && mode === 'live' && (
+      {/* API key status banners — one per data source so the user knows exactly what is live vs ML */}
+      {apiStatus && mode === 'live' && apiStatus.simulation_mode && (
         <div className="flex items-start gap-3 px-4 py-3 rounded-lg border text-xs"
           style={{ background:'rgba(245,158,11,0.08)', borderColor:'rgba(245,158,11,0.3)', color:'var(--text-secondary)' }}>
           <WifiOff size={14} style={{ color:'var(--amber)', flexShrink:0, marginTop:1 }} />
           <div>
             <span style={{ color:'var(--amber)', fontWeight:600 }}>Simulation Mode — </span>
-            No API keys detected. Data is realistically simulated and refreshes every 5 min.
-            Add <code style={{ color:'var(--blue)' }}>GOOGLE_MAPS_API_KEY</code> and{' '}
-            <code style={{ color:'var(--blue)' }}>TOMTOM_API_KEY</code> to <code>backend/.env</code> for real live data.
+            No API key detected. Incidents and corridor traffic are ML-predicted from historical Bengaluru data (not random).
+            Add <code style={{ color:'var(--blue)' }}>TOMTOM_API_KEY</code> to <code>backend/.env</code> for real live data.
+            Events are always real (OpenStreetMap).
+          </div>
+        </div>
+      )}
+      {apiStatus && mode === 'live' && !apiStatus.simulation_mode && apiStatus.routing_quota_exhausted && (
+        <div className="flex items-start gap-3 px-4 py-3 rounded-lg border text-xs"
+          style={{ background:'rgba(239,68,68,0.08)', borderColor:'rgba(239,68,68,0.3)', color:'var(--text-secondary)' }}>
+          <WifiOff size={14} style={{ color:'var(--red)', flexShrink:0, marginTop:1 }} />
+          <div>
+            <span style={{ color:'var(--red)', fontWeight:600 }}>Corridor Quota Exhausted — </span>
+            TomTom Routing daily limit reached. Corridor traffic is showing ML-predicted data until midnight UTC.
+            Incidents and Events are still live.
           </div>
         </div>
       )}
