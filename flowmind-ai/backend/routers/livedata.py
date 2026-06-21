@@ -56,7 +56,9 @@ async def fetch_osm_venues() -> list:
         # gets blocked by their edge — sending an identifying UA fixes it.
         headers = {
             "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic command center; contact: flowmind-ai@example.com)",
-            "Accept": "application/json",
+            # NOTE: Do NOT send Accept: application/json — Overpass's Apache edge
+            # returns HTTP 406 when that header is present with a form-data POST.
+            # The [out:json] directive in the query body controls the response format.
         }
         async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY}, headers=headers)
@@ -189,12 +191,12 @@ async def fetch_tomtom_incidents() -> list:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
         if not incidents:
-            logger.info("TomTom API call succeeded but returned 0 incidents — using ML fallback.")
-            return _fallback_incidents()
+            logger.info("TomTom API call succeeded but returned 0 incidents — no active incidents in Bengaluru.")
+            return []   # ← real empty result; do NOT substitute ML/fallback data
         return incidents
     except Exception as e:
         logger.warning("TomTom API request failed: %s", e)
-        return _fallback_incidents()
+        return _fallback_incidents()  # only use ML fallback on actual API failure
 
 # ── Google Maps — Routes API (traffic-aware travel time) ─────────────────────
 # NOTE: the legacy Distance Matrix API (maps/api/distancematrix/json) is being
