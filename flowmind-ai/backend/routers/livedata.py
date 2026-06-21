@@ -301,6 +301,7 @@ async def fetch_google_traffic() -> list:
     Results are cached for 10 minutes to stay within TomTom's 2,500/day free cap:
       7 corridors × 144 refreshes/day = 1,008 routing calls, leaving ~1,500 for incidents.
     """
+    global _corridor_cache, _corridor_cache_time
     if not TOMTOM_KEY:
         logger.info("TomTom Routing: no API key configured, using ML fallback.")
         return _fallback_google_traffic()
@@ -324,7 +325,6 @@ async def fetch_google_traffic() -> list:
         return _fallback_google_traffic()
 
     # Update cache
-    global _corridor_cache, _corridor_cache_time
     _corridor_cache = results
     _corridor_cache_time = datetime.now(timezone.utc)
     return results
