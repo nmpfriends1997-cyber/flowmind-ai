@@ -51,8 +51,18 @@ out body 80;
 
 async def fetch_osm_venues() -> list:
     try:
+        # Overpass's usage policy rejects requests without a descriptive
+        # User-Agent (returns 406/403). httpx's default UA ("python-httpx/x.y")
+        # gets blocked by their edge — sending an identifying UA fixes it.
+        headers = {
+            "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic command center; contact: flowmind-ai@example.com)",
+            "Accept": "application/json",
+        }
         async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY})
+            resp = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY}, headers=headers)
+        if resp.status_code != 200:
+            logger.warning("Overpass API returned HTTP %s: %s", resp.status_code, resp.text[:300])
+            return _fallback_events()
         elements = resp.json().get("elements", [])
         venues = []
         for el in elements:
@@ -100,6 +110,7 @@ async def fetch_osm_venues() -> list:
             })
         return venues[:60]
     except Exception as e:
+        logger.warning("Overpass API request failed: %s", e)
         return _fallback_events()
 
 # ── TomTom Traffic Incidents (free tier: 2500 req/day) ───────────────────────
@@ -185,9 +196,20 @@ async def fetch_tomtom_incidents() -> list:
         logger.warning("TomTom API request failed: %s", e)
         return _fallback_incidents()
 
-# ── Google Maps — Traffic Layer Waypoints ─────────────────────────────────────
-# Google's Traffic API requires Directions/Roads API; we use Roads API snap-to-roads
-# to get speed data on key Bengaluru corridors.
+# ── Google Maps — Routes API (traffic-aware travel time) ─────────────────────
+# NOTE: the legacy Distance Matrix API (maps/api/distancematrix/json) is being
+# retired and can no longer be enabled on newer Google Cloud projects — calling
+# it returns HTTP 200 with status=REQUEST_DENIED and a message telling you to
+# switch to the Routes API. This now uses Routes API's computeRoutes endpoint,
+# which Google explicitly recommends as the replacement: POST + JSON body +
+# API key in a header (not the URL) + an explicit field mask. "duration" is
+# the traffic-aware ETA; "staticDuration" is the free-flow baseline — together
+# they give us exactly what the old normal/with-traffic pair gave us.
+#
+# Requires the "Routes API" (a different API from "Distance Matrix API") to
+# be enabled for this key's project in Google Cloud Console, with billing on.
+GOOGLE_ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+
 BENGALURU_CORRIDORS = [
     {"name":"Outer Ring Road","points":"12.9352,77.6245|12.9716,77.6412|12.9933,77.6897"},
     {"name":"Mysore Road","points":"12.9523,77.5150|12.9411,77.4852|12.9305,77.4601"},
@@ -198,48 +220,53 @@ BENGALURU_CORRIDORS = [
     {"name":"Bannerghatta Road","points":"12.9050,77.5946|12.8650,77.5946|12.8250,77.5946"},
 ]
 
+def _parse_latlng(point_str: str):
+    lat, lng = point_str.split(",")
+    return float(lat), float(lng)
+
+def _parse_duration_seconds(value) -> float:
+    """Routes API durations come back as strings like '1234s'."""
+    if not value:
+        return 0.0
+    return float(str(value).rstrip("s"))
+
 async def _fetch_one_corridor(client: httpx.AsyncClient, corridor: dict):
     pts = corridor["points"].split("|")
-    origin = pts[0]
-    destination = pts[-1]
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    params = {
-        "origins": origin,
-        "destinations": destination,
-        "departure_time": "now",
-        "traffic_model": "best_guess",
-        "key": GOOGLE_MAPS_KEY,
+    origin_lat, origin_lng = _parse_latlng(pts[0])
+    dest_lat, dest_lng = _parse_latlng(pts[-1])
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_MAPS_KEY,
+        "X-Goog-FieldMask": "routes.duration,routes.staticDuration,routes.distanceMeters",
+    }
+    body = {
+        "origin": {"location": {"latLng": {"latitude": origin_lat, "longitude": origin_lng}}},
+        "destination": {"location": {"latLng": {"latitude": dest_lat, "longitude": dest_lng}}},
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
     }
     try:
-        resp = await client.get(url, params=params)
+        resp = await client.post(GOOGLE_ROUTES_URL, json=body, headers=headers)
         data = resp.json()
 
-        # Google returns HTTP 200 even when the request is denied/invalid —
-        # the real result is in the top-level "status" field (e.g.
-        # REQUEST_DENIED, INVALID_REQUEST, OVER_QUERY_LIMIT). The old code
-        # never checked this, so a bad/unauthorized key silently produced a
-        # fake "0% congestion, Google Maps Live" result instead of falling
-        # back to the ML model — making it look like live data was working
-        # when it wasn't.
-        top_status = data.get("status")
-        if top_status != "OK":
+        if resp.status_code != 200:
+            err = data.get("error", {})
             logger.warning(
-                "Google Distance Matrix denied for %s: status=%s error_message=%s",
-                corridor["name"], top_status, data.get("error_message"),
+                "Google Routes API denied for %s: HTTP %s code=%s status=%s message=%s",
+                corridor["name"], resp.status_code, err.get("code"), err.get("status"), err.get("message"),
             )
             return None
 
-        row = data.get("rows", [{}])[0].get("elements", [{}])[0]
-        if row.get("status") != "OK":
-            logger.warning(
-                "Google Distance Matrix element status not OK for %s: %s",
-                corridor["name"], row.get("status"),
-            )
+        routes = data.get("routes", [])
+        if not routes:
+            logger.warning("Google Routes API returned no routes for %s: %s", corridor["name"], data)
             return None
 
-        duration_normal = row.get("duration",{}).get("value", 0)
-        duration_traffic = row.get("duration_in_traffic",{}).get("value", 0)
-        distance_m = row.get("distance",{}).get("value", 0)
+        route = routes[0]
+        duration_traffic = _parse_duration_seconds(route.get("duration"))
+        duration_normal = _parse_duration_seconds(route.get("staticDuration")) or duration_traffic
+        distance_m = route.get("distanceMeters", 0)
 
         congestion_ratio = (duration_traffic / duration_normal) if duration_normal > 0 else 1.0
         congestion_pct = int(np_clip((congestion_ratio - 1) * 100, 0, 99))
@@ -261,7 +288,7 @@ async def _fetch_one_corridor(client: httpx.AsyncClient, corridor: dict):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
-        logger.warning("Google Distance Matrix request failed for %s: %s", corridor["name"], e)
+        logger.warning("Google Routes API request failed for %s: %s", corridor["name"], e)
         return None
 
 def np_clip(v, lo, hi):
