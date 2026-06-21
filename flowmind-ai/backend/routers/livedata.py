@@ -4,7 +4,7 @@ Fetches real-time traffic + events from Google Maps, TomTom, and Overpass (OSM e
 Falls back to the trained ML engine (not random simulation) when API keys are not set.
 """
 
-import httpx, os, asyncio, math
+import httpx, os, asyncio, math, logging
 from fastapi import APIRouter
 from datetime import datetime, timezone
 from ml.engine import (
@@ -14,6 +14,7 @@ from ml.engine import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("flowmind.livedata")
 
 GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 TOMTOM_KEY      = os.getenv("TOMTOM_API_KEY", "")
@@ -104,17 +105,37 @@ async def fetch_osm_venues() -> list:
 # ── TomTom Traffic Incidents (free tier: 2500 req/day) ───────────────────────
 async def fetch_tomtom_incidents() -> list:
     if not TOMTOM_KEY:
+        logger.info("TomTom: no API key configured, using ML fallback.")
         return _fallback_incidents()
-    url = (
-        f"https://api.tomtom.com/traffic/services/5/incidentDetails"
-        f"?key={TOMTOM_KEY}"
-        f"&bbox={BLR_BBOX}"
-        f"&fields={{incidents{{type,geometry{{type,coordinates}},properties{{id,iconCategory,magnitudeOfDelay,events{{description,code,iconCategory}},startTime,endTime,from,to,length,delay,roadNumbers,timeValidity}}}}}}"
-        f"&language=en-GB&categoryFilter=0,1,2,3,4,5,6,7,8,9,10,11,14&timeValidityFilter=present"
+
+    # NOTE: this 'fields' value contains literal { } characters that TomTom's
+    # API requires as a GraphQL-style field selector. Previously these were
+    # baked directly into an f-string URL unescaped, which TomTom's edge can
+    # reject or silently mis-parse. Passing it through httpx's `params=` dict
+    # lets httpx percent-encode it correctly.
+    fields = (
+        "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,"
+        "magnitudeOfDelay,events{description,code,iconCategory},startTime,endTime,"
+        "from,to,length,delay,roadNumbers,timeValidity}}}"
     )
+    url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
+    params = {
+        "key": TOMTOM_KEY,
+        "bbox": BLR_BBOX,
+        "fields": fields,
+        "language": "en-GB",
+        "categoryFilter": "0,1,2,3,4,5,6,7,8,9,10,11,14",
+        "timeValidityFilter": "present",
+    }
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            logger.warning(
+                "TomTom API returned HTTP %s: %s",
+                resp.status_code, resp.text[:300],
+            )
+            return _fallback_incidents()
         data = resp.json()
         incidents = []
         for inc in data.get("incidents", [])[:50]:
@@ -156,8 +177,12 @@ async def fetch_tomtom_incidents() -> list:
                 "source": "TomTom Live",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-        return incidents if incidents else _fallback_incidents()
-    except Exception:
+        if not incidents:
+            logger.info("TomTom API call succeeded but returned 0 incidents — using ML fallback.")
+            return _fallback_incidents()
+        return incidents
+    except Exception as e:
+        logger.warning("TomTom API request failed: %s", e)
         return _fallback_incidents()
 
 # ── Google Maps — Traffic Layer Waypoints ─────────────────────────────────────
@@ -177,16 +202,41 @@ async def _fetch_one_corridor(client: httpx.AsyncClient, corridor: dict):
     pts = corridor["points"].split("|")
     origin = pts[0]
     destination = pts[-1]
-    url = (
-        f"https://maps.googleapis.com/maps/api/distancematrix/json"
-        f"?origins={origin}&destinations={destination}"
-        f"&departure_time=now&traffic_model=best_guess"
-        f"&key={GOOGLE_MAPS_KEY}"
-    )
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        "origins": origin,
+        "destinations": destination,
+        "departure_time": "now",
+        "traffic_model": "best_guess",
+        "key": GOOGLE_MAPS_KEY,
+    }
     try:
-        resp = await client.get(url)
+        resp = await client.get(url, params=params)
         data = resp.json()
-        row = data.get("rows",[{}])[0].get("elements",[{}])[0]
+
+        # Google returns HTTP 200 even when the request is denied/invalid —
+        # the real result is in the top-level "status" field (e.g.
+        # REQUEST_DENIED, INVALID_REQUEST, OVER_QUERY_LIMIT). The old code
+        # never checked this, so a bad/unauthorized key silently produced a
+        # fake "0% congestion, Google Maps Live" result instead of falling
+        # back to the ML model — making it look like live data was working
+        # when it wasn't.
+        top_status = data.get("status")
+        if top_status != "OK":
+            logger.warning(
+                "Google Distance Matrix denied for %s: status=%s error_message=%s",
+                corridor["name"], top_status, data.get("error_message"),
+            )
+            return None
+
+        row = data.get("rows", [{}])[0].get("elements", [{}])[0]
+        if row.get("status") != "OK":
+            logger.warning(
+                "Google Distance Matrix element status not OK for %s: %s",
+                corridor["name"], row.get("status"),
+            )
+            return None
+
         duration_normal = row.get("duration",{}).get("value", 0)
         duration_traffic = row.get("duration_in_traffic",{}).get("value", 0)
         distance_m = row.get("distance",{}).get("value", 0)
@@ -210,7 +260,8 @@ async def _fetch_one_corridor(client: httpx.AsyncClient, corridor: dict):
             "source": "Google Maps Live",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-    except Exception:
+    except Exception as e:
+        logger.warning("Google Distance Matrix request failed for %s: %s", corridor["name"], e)
         return None
 
 def np_clip(v, lo, hi):
@@ -218,11 +269,15 @@ def np_clip(v, lo, hi):
 
 async def fetch_google_traffic() -> list:
     if not GOOGLE_MAPS_KEY:
+        logger.info("Google Maps: no API key configured, using ML fallback.")
         return _fallback_google_traffic()
     async with httpx.AsyncClient(timeout=8) as client:
         results = await asyncio.gather(*[_fetch_one_corridor(client, c) for c in BENGALURU_CORRIDORS])
     results = [r for r in results if r is not None]
-    return results if results else _fallback_google_traffic()
+    if not results:
+        logger.info("Google Maps: all corridor requests failed/denied — using ML fallback.")
+        return _fallback_google_traffic()
+    return results
 
 # ── Fallback data — ML-driven, NOT random ─────────────────────────────────────
 # When TomTom/Google keys are absent or a live call fails, we don't want to
