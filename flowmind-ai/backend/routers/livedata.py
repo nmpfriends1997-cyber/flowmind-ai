@@ -6,7 +6,7 @@ Falls back to the trained ML engine (not random simulation) when API keys are no
 
 import httpx, os, asyncio, math, logging
 from fastapi import APIRouter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from ml.engine import (
     predict_corridor_congestion_now as ml_predict_corridor_now,
     sample_live_incidents as ml_sample_live_incidents,
@@ -22,6 +22,27 @@ TOMTOM_KEY      = os.getenv("TOMTOM_API_KEY", "")
 # Bengaluru bounding box
 BLR_LAT, BLR_LNG = 12.9716, 77.5946
 BLR_BBOX = "12.7343,77.3791,13.1435,77.8388"   # south,west,north,east
+
+# ── Google 429 quota-exhaustion backoff ───────────────────────────────────────
+# When all 7 corridors hit HTTP 429 ("daily quota exhausted"), continuing to
+# fire requests every 60 s burns the remaining quota for the next day too.
+# We track the calendar date the 429 was first seen; if it matches today we
+# skip all Google API calls and go straight to ML fallback, logging only once.
+_google_quota_exhausted_date: date | None = None
+
+def _google_quota_exhausted() -> bool:
+    """True if quota was exhausted today (UTC date match)."""
+    return _google_quota_exhausted_date == datetime.now(timezone.utc).date()
+
+def _mark_google_quota_exhausted() -> None:
+    global _google_quota_exhausted_date
+    today = datetime.now(timezone.utc).date()
+    if _google_quota_exhausted_date != today:   # log only once per day
+        logger.warning(
+            "Google Routes API daily quota exhausted — switching to ML fallback "
+            "for the rest of today (%s UTC). Quota resets at midnight UTC.", today
+        )
+    _google_quota_exhausted_date = today
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _haversine(lat1, lon1, lat2, lon2):
@@ -51,12 +72,11 @@ out body 80;
 
 async def fetch_osm_venues() -> list:
     try:
-        # Overpass's usage policy rejects requests without a descriptive
-        # User-Agent (returns 406/403). httpx's default UA ("python-httpx/x.y")
-        # gets blocked by their edge — sending an identifying UA fixes it.
         headers = {
             "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic command center; contact: flowmind-ai@example.com)",
-            "Accept": "application/json",
+            # NOTE: Do NOT send Accept: application/json — Overpass's Apache edge
+            # returns HTTP 406 when that header is present with a form-data POST.
+            # The [out:json] directive in the query body controls the response format.
         }
         async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY}, headers=headers)
@@ -93,9 +113,7 @@ async def fetch_osm_venues() -> list:
                 "attraction": (500, 5000),
             }.get(amenity, (100, 2000))
             crowd_est = ml_estimate_venue_crowd(*cap_ranges)
-
             risk = "High" if crowd_est > 10000 else "Moderate" if crowd_est > 3000 else "Low"
-
             venues.append({
                 "id": f"osm-{el['id']}",
                 "name": name,
@@ -119,11 +137,6 @@ async def fetch_tomtom_incidents() -> list:
         logger.info("TomTom: no API key configured, using ML fallback.")
         return _fallback_incidents()
 
-    # NOTE: this 'fields' value contains literal { } characters that TomTom's
-    # API requires as a GraphQL-style field selector. Previously these were
-    # baked directly into an f-string URL unescaped, which TomTom's edge can
-    # reject or silently mis-parse. Passing it through httpx's `params=` dict
-    # lets httpx percent-encode it correctly.
     fields = (
         "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,"
         "magnitudeOfDelay,events{description,code,iconCategory},startTime,endTime,"
@@ -189,35 +202,27 @@ async def fetch_tomtom_incidents() -> list:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
         if not incidents:
-            logger.info("TomTom API call succeeded but returned 0 incidents — using ML fallback.")
-            return _fallback_incidents()
+            # HTTP 200 + empty list = TomTom confirms no active incidents right now.
+            # Do NOT substitute ML fallback here — that would show historical data
+            # as if it were live. Return empty so the map shows zero markers.
+            logger.info("TomTom API call succeeded but returned 0 incidents — no active incidents in Bengaluru.")
+            return []
         return incidents
     except Exception as e:
         logger.warning("TomTom API request failed: %s", e)
-        return _fallback_incidents()
+        return _fallback_incidents()   # only use ML fallback on actual API failure
 
 # ── Google Maps — Routes API (traffic-aware travel time) ─────────────────────
-# NOTE: the legacy Distance Matrix API (maps/api/distancematrix/json) is being
-# retired and can no longer be enabled on newer Google Cloud projects — calling
-# it returns HTTP 200 with status=REQUEST_DENIED and a message telling you to
-# switch to the Routes API. This now uses Routes API's computeRoutes endpoint,
-# which Google explicitly recommends as the replacement: POST + JSON body +
-# API key in a header (not the URL) + an explicit field mask. "duration" is
-# the traffic-aware ETA; "staticDuration" is the free-flow baseline — together
-# they give us exactly what the old normal/with-traffic pair gave us.
-#
-# Requires the "Routes API" (a different API from "Distance Matrix API") to
-# be enabled for this key's project in Google Cloud Console, with billing on.
 GOOGLE_ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 BENGALURU_CORRIDORS = [
-    {"name":"Outer Ring Road","points":"12.9352,77.6245|12.9716,77.6412|12.9933,77.6897"},
-    {"name":"Mysore Road","points":"12.9523,77.5150|12.9411,77.4852|12.9305,77.4601"},
-    {"name":"Bellary Road","points":"13.0240,77.5946|13.0578,77.5870|13.0950,77.5780"},
-    {"name":"Hosur Road","points":"12.9270,77.6210|12.8910,77.6401|12.8550,77.6602"},
-    {"name":"Old Madras Road","points":"12.9858,77.6412|13.0100,77.6601|13.0350,77.6920"},
-    {"name":"Tumkur Road","points":"13.0240,77.5480|13.0550,77.5120|13.0850,77.4850"},
-    {"name":"Bannerghatta Road","points":"12.9050,77.5946|12.8650,77.5946|12.8250,77.5946"},
+    {"name":"Outer Ring Road",    "points":"12.9352,77.6245|12.9716,77.6412|12.9933,77.6897"},
+    {"name":"Mysore Road",        "points":"12.9523,77.5150|12.9411,77.4852|12.9305,77.4601"},
+    {"name":"Bellary Road",       "points":"13.0240,77.5946|13.0578,77.5870|13.0950,77.5780"},
+    {"name":"Hosur Road",         "points":"12.9270,77.6210|12.8910,77.6401|12.8550,77.6602"},
+    {"name":"Old Madras Road",    "points":"12.9858,77.6412|13.0100,77.6601|13.0350,77.6920"},
+    {"name":"Tumkur Road",        "points":"13.0240,77.5480|13.0550,77.5120|13.0850,77.4850"},
+    {"name":"Bannerghatta Road",  "points":"12.9050,77.5946|12.8650,77.5946|12.8250,77.5946"},
 ]
 
 def _parse_latlng(point_str: str):
@@ -225,7 +230,6 @@ def _parse_latlng(point_str: str):
     return float(lat), float(lng)
 
 def _parse_duration_seconds(value) -> float:
-    """Routes API durations come back as strings like '1234s'."""
     if not value:
         return 0.0
     return float(str(value).rstrip("s"))
@@ -249,6 +253,12 @@ async def _fetch_one_corridor(client: httpx.AsyncClient, corridor: dict):
     try:
         resp = await client.post(GOOGLE_ROUTES_URL, json=body, headers=headers)
         data = resp.json()
+
+        if resp.status_code == 429:
+            # Daily quota exhausted — mark it so all subsequent calls this day
+            # skip the API entirely rather than hammering it with more 429s.
+            _mark_google_quota_exhausted()
+            return None
 
         if resp.status_code != 200:
             err = data.get("error", {})
@@ -298,6 +308,11 @@ async def fetch_google_traffic() -> list:
     if not GOOGLE_MAPS_KEY:
         logger.info("Google Maps: no API key configured, using ML fallback.")
         return _fallback_google_traffic()
+
+    # If quota was already exhausted today, skip all API calls immediately.
+    if _google_quota_exhausted():
+        return _fallback_google_traffic()
+
     async with httpx.AsyncClient(timeout=8) as client:
         results = await asyncio.gather(*[_fetch_one_corridor(client, c) for c in BENGALURU_CORRIDORS])
     results = [r for r in results if r is not None]
@@ -307,11 +322,6 @@ async def fetch_google_traffic() -> list:
     return results
 
 # ── Fallback data — ML-driven, NOT random ─────────────────────────────────────
-# When TomTom/Google keys are absent or a live call fails, we don't want to
-# show fabricated random numbers. Instead these fall back to the trained
-# FlowMind ML engine running against the real historical Bengaluru dataset,
-# so "live" values are genuine model output (reproducible, time-aware,
-# data-grounded) rather than noise.
 def _fallback_incidents() -> list:
     return ml_sample_live_incidents(15)
 
@@ -331,7 +341,7 @@ def _fallback_google_traffic() -> list:
             "congestion_level": level,
             "duration_normal_min": pred["duration_normal_min"],
             "duration_traffic_min": pred["duration_traffic_min"],
-            "distance_km": round(pred["duration_normal_min"] / 2.2, 1),  # ~urban avg speed proxy
+            "distance_km": round(pred["duration_normal_min"] / 2.2, 1),
             "delay_min": pred["delay_min"],
             "source": "ML-predicted (live API not configured)",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -378,7 +388,7 @@ def _fallback_events() -> list:
 @router.get("/traffic-incidents")
 async def traffic_incidents():
     data = await fetch_tomtom_incidents()
-    return {"count": len(data), "source": data[0]["source"] if data else "none", "incidents": data}
+    return {"count": len(data), "source": data[0]["source"] if data else "TomTom Live (0 active incidents)", "incidents": data}
 
 @router.get("/google-traffic")
 async def google_traffic():
@@ -399,7 +409,7 @@ async def live_snapshot():
         fetch_osm_venues(),
     )
     critical = sum(1 for t in traffic if t["congestion_level"] == "Critical")
-    high_inc  = sum(1 for i in incidents if i["magnitude"] >= 3)
+    high_inc  = sum(1 for i in incidents if i.get("magnitude", 0) >= 3)
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "summary": {
@@ -420,6 +430,7 @@ async def config_status():
     return {
         "google_maps": bool(GOOGLE_MAPS_KEY),
         "tomtom": bool(TOMTOM_KEY),
-        "osm": True,   # always free
+        "osm": True,
         "simulation_mode": not (GOOGLE_MAPS_KEY or TOMTOM_KEY),
+        "google_quota_exhausted": _google_quota_exhausted(),
     }
