@@ -1022,11 +1022,15 @@ def sample_live_incidents(limit: int = 15) -> list:
         if models:
             congestion = float(models["gbr"].predict(x_row)[0]) * 0.6 + float(models["rfr"].predict(x_row)[0]) * 0.4
             closure_p  = float(models["gbc"].predict_proba(x_row)[0][1])
+            # Use the trained gbr_delay model for realistic per-incident delays
+            # (gbr_delay was fit on duration_min * 0.35, so inverse-scale back to minutes)
+            delay_min_pred = float(models["gbr_delay"].predict(x_row)[0]) / 0.35
+            delay_sec = int(np.clip(delay_min_pred * 60, 60, 2700))
         else:
             congestion, closure_p = 40.0, 0.2
+            delay_sec = 600  # 10-min fallback when no models loaded
         magnitude = 4 if congestion >= 70 else 3 if congestion >= 50 else 2 if congestion >= 30 else 1
         severity  = {1: "Minor", 2: "Moderate", 3: "Major", 4: "Critical"}[magnitude]
-        delay_sec = int(np.clip(congestion * 18, 60, 2700))
 
         out.append({
             "id": f"hist-{r['id']}",
