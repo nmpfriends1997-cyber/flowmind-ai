@@ -15,10 +15,6 @@ import httpx, os, asyncio, math, logging
 from fastapi import APIRouter
 from datetime import datetime, timezone, date
 from ml.engine import estimate_venue_crowd as ml_estimate_venue_crowd
-# NOTE: ml_sample_live_incidents and ml_predict_corridor_now are intentionally
-# NOT imported. This router only serves real live data. When no API key is
-# configured, incidents and corridors return [] so the map stays blank — no
-# fabricated/ML-predicted data is ever shown as if it were live.
 
 router = APIRouter()
 logger = logging.getLogger("flowmind.livedata")
@@ -375,10 +371,72 @@ async def fetch_google_traffic() -> list:
                 len(results), len(BENGALURU_CORRIDORS), CORRIDOR_CACHE_TTL)
     return results
 
-# ── No ML fallbacks for live data ─────────────────────────────────────────────
-# Incidents and corridors return [] when no API key is set or TomTom is down.
-# The map intentionally stays blank rather than showing fabricated data as live.
-# Only real TomTom data is ever returned. OSM venues (events) are always real.
+# ── ML fallbacks — stable, cached, not random ────────────────────────────────
+def _fallback_incidents() -> list:
+    return ml_sample_live_incidents(15)
+
+def _fallback_google_traffic() -> list:
+    global _ml_traffic_cache, _ml_traffic_cache_time
+
+    if _ml_traffic_cache and _ml_traffic_cache_time:
+        age = (datetime.now(timezone.utc) - _ml_traffic_cache_time).total_seconds()
+        if age < ML_CACHE_TTL:
+            return _ml_traffic_cache
+
+    results = []
+    for corridor in BENGALURU_CORRIDORS:
+        pts = corridor["points"].split("|")
+        mid = pts[len(pts) // 2].split(",")
+        pred = ml_predict_corridor_now(corridor["name"])
+        base = pred["congestion_pct"]
+        level = "Critical" if base > 70 else "High" if base > 45 else "Moderate" if base > 20 else "Free Flow"
+        results.append({
+            "corridor": corridor["name"],
+            "latitude": float(mid[0]),
+            "longitude": float(mid[1]),
+            "congestion_pct": base,
+            "congestion_level": level,
+            "duration_normal_min": pred["duration_normal_min"],
+            "duration_traffic_min": pred["duration_traffic_min"],
+            "distance_km": round(pred["duration_normal_min"] / 2.2, 1),
+            "delay_min": pred["delay_min"],
+            "source": "ML-predicted (TomTom Flow unavailable)",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    _ml_traffic_cache = results
+    _ml_traffic_cache_time = datetime.now(timezone.utc)
+    return results
+
+def _fallback_events() -> list:
+    places = [
+        ("Chinnaswamy Stadium",      "Sports Event",    12.9791, 77.5993, 18000, 55000),
+        ("Lalbagh Botanical Garden", "Public Gathering", 12.9507, 77.5848,  2500, 11000),
+        ("Cubbon Park",              "Public Event",     12.9763, 77.5929,  1500,  9000),
+        ("Bannerghatta National Park","Tourist Event",   12.8019, 77.5751,   400,  3500),
+        ("ISKCON Temple",            "Religious Event",  13.0094, 77.5510,  4000, 22000),
+        ("Palace Grounds",           "Cultural Event",   13.0059, 77.5700,  8000, 42000),
+        ("Freedom Park",             "Public Event",     12.9690, 77.5780,   800, 16000),
+        ("Kanteerava Stadium",       "Sports Event",     12.9738, 77.5980,  6000, 26000),
+        ("UB City Mall",             "Public Gathering", 12.9716, 77.5970,  2500, 13000),
+        ("Vidhana Soudha",           "Government Event", 12.9789, 77.5917,   400,  5500),
+        ("IIM Bangalore",            "Academic Event",   13.0694, 77.5994,   800,  5200),
+        ("Jakkur Aerodrome",         "Special Event",    13.0820, 77.5900,   400,  3200),
+        ("Koramangala Park",         "Public Gathering", 12.9340, 77.6270,   400,  5200),
+    ]
+    events = []
+    for name, etype, lat, lng, cap_min, cap_max in places:
+        crowd = ml_estimate_venue_crowd(cap_min, cap_max)
+        risk = "High" if crowd > 15000 else "Moderate" if crowd > 5000 else "Low"
+        events.append({
+            "id": f"venue-{name[:6].replace(' ', '')}",
+            "name": name, "event_type": etype, "amenity": "venue",
+            "latitude": lat, "longitude": lng,
+            "crowd_estimate": crowd, "risk_level": risk,
+            "source": "ML-predicted (Overpass unavailable)",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    return events
 
 # ── API Endpoints ─────────────────────────────────────────────────────────────
 @router.get("/traffic-incidents")
