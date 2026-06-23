@@ -59,12 +59,17 @@ def np_clip(v, lo, hi):
     return max(lo, min(hi, v))
 
 # ── Overpass — real OSM venue data ───────────────────────────────────────────
-# The public overpass-api.de instance frequently returns 504 under load, so we
-# try it first and fall back to a second public mirror before giving up on
-# live venue data entirely.
+# The public Overpass instances are notoriously flaky under load (504s, 429s)
+# and overpass-api.de's Apache front-end specifically returns 406 Not
+# Acceptable if it sees an Accept/Accept-Encoding header it doesn't like —
+# httpx adds both of those by default even when you don't set them yourself,
+# so we explicitly null them out below. We also try several mirrors in order
+# before giving up, since any single free instance can be down at any time.
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
 ]
 OVERPASS_QUERY = """
 [out:json][timeout:25];
@@ -82,16 +87,18 @@ out body 80;
 """
 
 async def fetch_osm_venues() -> list:
-    headers = {
-        "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic; flowmind-ai@example.com)",
-        # IMPORTANT: No Accept header — Overpass Apache returns 406 if present.
-        # [out:json] in the query body controls response format instead.
-    }
     last_error = None
     for url in OVERPASS_URLS:
         try:
             async with httpx.AsyncClient(timeout=12) as client:
-                resp = await client.post(url, data={"data": OVERPASS_QUERY}, headers=headers)
+                client.headers["User-Agent"] = "FlowMindAI/1.0 (Bengaluru traffic; flowmind-ai@example.com)"
+                # Actually remove (not just blank-out — httpx rejects None as a
+                # header value) the Accept/Accept-Encoding headers httpx adds
+                # by default. Overpass's Apache mod_negotiation 406s on some
+                # combinations of these even though we never asked for them.
+                for h in ("Accept", "Accept-Encoding"):
+                    client.headers.pop(h, None)
+                resp = await client.post(url, data={"data": OVERPASS_QUERY})
             if resp.status_code != 200:
                 logger.warning("Overpass (%s) returned HTTP %s: %s", url, resp.status_code, resp.text[:200])
                 last_error = f"HTTP {resp.status_code}"
@@ -134,8 +141,11 @@ async def fetch_osm_venues() -> list:
             logger.info("Overpass (%s) returned %d venues.", url, len(venues))
             return venues[:60]
         except Exception as e:
-            logger.warning("Overpass request to %s failed: %s", url, e)
-            last_error = str(e)
+            # str(e) is often empty for httpx connection-level errors (e.g.
+            # ConnectError, ConnectTimeout) — log the exception type too so
+            # the cause is actually diagnosable from the server logs.
+            logger.warning("Overpass request to %s failed: %s: %r", url, type(e).__name__, e)
+            last_error = f"{type(e).__name__}: {e}"
             continue  # try the next mirror
 
     logger.warning("All Overpass endpoints failed (%s) — using ML fallback.", last_error)
