@@ -34,7 +34,7 @@ export default function Assistant() {
       const { reply } = await sendChatMessage(msg, messages)
       setMessages(m => [...m, { role: 'assistant', content: reply }])
     } catch {
-      setMessages(m => [...m, { role: 'assistant', content: '⚠️ Connection error. Make sure the backend is running and ANTHROPIC_API_KEY is set in backend/.env' }])
+      setMessages(m => [...m, { role: 'assistant', content: '⚠️ Connection error. Make sure the backend is running and OPENROUTER_API_KEY is set in backend/.env' }])
     }
     setLoading(false)
   }
@@ -43,7 +43,7 @@ export default function Assistant() {
     <div className="p-6 h-[calc(100vh-56px)] flex flex-col gap-4 animate-slide-in">
       <div>
         <h1 className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>AI Assistant</h1>
-        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>Powered by Claude · Trained on Bengaluru event intelligence</p>
+        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>Powered by OpenRouter · Trained on Bengaluru event intelligence</p>
       </div>
 
       <div className="flex-1 flex gap-4 min-h-0">
