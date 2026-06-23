@@ -6,9 +6,10 @@ from ml.engine import get_summary_stats, get_zone_risk, get_cause_distribution, 
 
 router = APIRouter()
 
-# ── Get your FREE Gemini API key at: https://aistudio.google.com/app/apikey ──
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+# ── Get your FREE Groq API key at: https://console.groq.com ──
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"  # Free, fast, very capable
 
 
 def get_bangalore_time_context() -> str:
@@ -80,7 +81,7 @@ KEY ROAD CORRIDORS:
 
 NAMMA METRO (2025-2026):
 - Purple Line (Baiyappanahalli to Mysuru Road): operational, reduces ORR load significantly
-- Green Line (Nagasandra to Silk Board): Phase 2 construction — lane closures near Shivajinagar, Majestic, Jayanagar
+- Green Line (Nagasandra to Silk Board): Phase 2 construction, lane closures near Shivajinagar, Majestic, Jayanagar
 - Phase 2 active construction at Koramangala, Hebbal, Sarjapur Road — expect 20-40 min extra delays nearby
 - Best Metro use cases: MG Road to Indiranagar, Majestic to Byappanahalli, Whitefield corridor
 
@@ -100,8 +101,8 @@ ALTERNATE ROUTES:
 - Whitefield peak: use Old Madras Road via KR Puram (off-peak only)
 
 RESPONSE RULES:
-- Always mention whether it is currently peak or off-peak based on the time context
-- Use specific junction and road names — never vague directions
+- Always mention whether it is currently peak or off-peak based on the time context above
+- Use specific junction and road names, never vague directions
 - Reference ML dataset numbers when relevant
 - Suggest Namma Metro when it is a viable option
 - Keep responses under 200 words unless a detailed route or breakdown is requested
@@ -117,54 +118,53 @@ class ChatRequest(BaseModel):
 
 @router.post("/chat")
 async def chat(req: ChatRequest):
-    if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("your_"):
+    if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
         return {
             "reply": (
-                "Gemini API key not set.\n"
-                "Get your FREE key at: https://aistudio.google.com/app/apikey\n"
-                "Then add GEMINI_API_KEY=your_key to your backend/.env file."
+                "⚠️ Groq API key not set.\n"
+                "Get your FREE key at: https://console.groq.com\n"
+                "Then add GROQ_API_KEY=your_key to your backend/.env file."
             )
         }
 
     system_prompt = build_system_prompt()
 
-    contents = []
+    # Groq uses OpenAI-compatible format
+    messages = [{"role": "system", "content": system_prompt}]
     for h in req.history[-6:]:
-        role = "user" if h["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": h["content"]}]})
-    contents.append({"role": "user", "parts": [{"text": req.message}]})
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": req.message})
 
     payload = {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": 512,
-            "temperature": 0.4,
-            "topP": 0.9,
-        }
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "max_tokens": 512,
+        "temperature": 0.4,
+        "top_p": 0.9,
     }
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                headers={"Content-Type": "application/json"},
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
                 json=payload,
             )
 
         data = resp.json()
 
-        if "candidates" in data and data["candidates"]:
-            reply = data["candidates"][0]["content"]["parts"][0]["text"]
+        if "choices" in data and data["choices"]:
+            reply = data["choices"][0]["message"]["content"]
         elif "error" in data:
             err = data["error"].get("message", "Unknown error")
-            reply = f"Gemini API error: {err}"
+            reply = f"⚠️ Groq API error: {err}"
         else:
-            reply = f"Unexpected response. Raw: {data}"
+            reply = f"⚠️ Unexpected response. Raw: {data}"
 
         return {"reply": reply}
 
     except Exception as e:
-        return {"reply": f"Connection error: {str(e)}"}
+        return {"reply": f"⚠️ Connection error: {str(e)}"}
