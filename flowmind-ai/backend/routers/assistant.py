@@ -8,17 +8,65 @@ router = APIRouter()
 
 # ── Get your FREE OpenRouter API key at: https://openrouter.ai ──
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_URL    = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
 
-# Updated free models list — June 2026 verified working on OpenRouter
-FREE_MODELS = [
-    "deepseek/deepseek-r1:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "nvidia/llama-3.1-nemotron-70b-instruct:free",
-    "qwen/qwen3-235b-a22b:free",
-    "google/gemma-3-12b-it:free",
-    "openai/gpt-5.4-nano:free",
-]
+# Cache so we don't fetch the model list on every single request
+_free_models_cache: list[str] = []
+_cache_timestamp: datetime | None = None
+CACHE_TTL_MINUTES = 30
+
+
+async def get_free_models() -> list[str]:
+    """
+    Fetch all models from OpenRouter and return IDs that are completely free
+    (both prompt and completion cost = 0). Results are cached for 30 minutes.
+    """
+    global _free_models_cache, _cache_timestamp
+
+    now = datetime.now(timezone.utc)
+    if (
+        _free_models_cache
+        and _cache_timestamp
+        and (now - _cache_timestamp).total_seconds() < CACHE_TTL_MINUTES * 60
+    ):
+        return _free_models_cache
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                OPENROUTER_MODELS,
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            )
+        data = resp.json()
+        models = data.get("data", [])
+
+        free = []
+        for m in models:
+            pricing = m.get("pricing", {})
+            prompt_cost     = float(pricing.get("prompt", 1))
+            completion_cost = float(pricing.get("completion", 1))
+            if prompt_cost == 0 and completion_cost == 0:
+                free.append(m["id"])
+
+        # Prefer larger / better-known models first
+        priority_keywords = ["llama-3", "deepseek", "qwen", "gemma", "nemotron", "mistral"]
+        def sort_key(mid: str):
+            mid_lower = mid.lower()
+            for i, kw in enumerate(priority_keywords):
+                if kw in mid_lower:
+                    return i
+            return len(priority_keywords)
+
+        free.sort(key=sort_key)
+
+        _free_models_cache = free
+        _cache_timestamp   = now
+        return free
+
+    except Exception:
+        # If we can't reach OpenRouter models endpoint, return cached list or empty
+        return _free_models_cache or []
 
 
 def get_bangalore_time_context() -> str:
@@ -158,16 +206,26 @@ async def chat(req: ChatRequest):
             )
         }
 
-    system_prompt = build_system_prompt()
+    # Dynamically fetch available free models at runtime
+    free_models = await get_free_models()
 
+    if not free_models:
+        return {
+            "reply": (
+                "⚠️ Could not fetch available free models from OpenRouter.\n"
+                "Please check your internet connection or visit https://openrouter.ai/models"
+            )
+        }
+
+    system_prompt = build_system_prompt()
     messages = [{"role": "system", "content": system_prompt}]
     for h in req.history[-6:]:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": req.message})
 
-    # Try each free model in order until one succeeds
+    # Try each free model until one succeeds
     errors = []
-    for model in FREE_MODELS:
+    for model in free_models:
         try:
             data = await call_model(messages, model)
 
@@ -182,11 +240,17 @@ async def chat(req: ChatRequest):
             errors.append(f"{model}: {str(e)}")
             continue
 
-    # All models failed — tell user to check openrouter.ai/models for current free models
     return {
         "reply": (
-            "⚠️ All free models are currently unavailable on OpenRouter.\n\n"
-            "Please check https://openrouter.ai/models — filter by 'Free' to see what's currently working.\n"
-            "Then update FREE_MODELS list in assistant.py with a working model ID ending in :free."
+            "⚠️ All free models on OpenRouter are currently unavailable.\n"
+            "Please try again in a few minutes or visit https://openrouter.ai/models to check status."
         )
     }
+
+
+# ── Bonus endpoint: see which free models are available right now ──
+@router.get("/available-models")
+async def available_models():
+    """Returns the list of currently available free models from OpenRouter."""
+    models = await get_free_models()
+    return {"free_models": models, "count": len(models)}
