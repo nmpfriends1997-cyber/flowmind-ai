@@ -155,7 +155,7 @@ export default function CityMap() {
           })
           L.marker([inc.latitude, inc.longitude], { icon })
             .on('click', () => setSelectedItem({ type:'incident', data:inc }))
-            .bindTooltip(`<b>${inc.cause}</b><br/>${inc.road}<br/>Delay: ${Math.round(inc.delay_sec/60)} min`, { permanent:false })
+            .bindTooltip(`<b>${inc.cause}</b><br/>${inc.road}<br/>${inc.delay_sec >= 60 ? `Delay: +${Math.round(inc.delay_sec/60)} min` : inc.description || 'Active incident'}`, { permanent:false })
             .addTo(layerGroup.current)
         })
 
@@ -409,8 +409,12 @@ export default function CityMap() {
                         <span className="font-semibold truncate" style={{ color:'var(--text-primary)' }}>{item.cause}</span>
                         <span className="ml-auto text-[10px] font-mono" style={{ color }}>{item.severity}</span>
                       </div>
-                      <div className="truncate" style={{ color:'var(--text-secondary)' }}>{item.road}</div>
-                      {item.delay_sec > 0 && <div style={{ color:'var(--amber)' }}>+{Math.round(item.delay_sec/60)} min delay</div>}
+                      <div className="truncate" style={{ color:'var(--text-secondary)' }}>
+                        {item.from && item.to ? `${item.from} → ${item.to}` : item.road}
+                      </div>
+                      <div style={{ color: item.delay_sec >= 60 ? 'var(--amber)' : 'var(--text-muted)' }}>
+                        {item.delay_sec >= 60 ? `+${Math.round(item.delay_sec/60)} min delay` : item.description || 'Active incident'}
+                      </div>
                     </div>
                   )
                 }
@@ -485,7 +489,7 @@ export default function CityMap() {
               <div className="p-4 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
                 {selectedItem.type === 'incident' && (<>
                   {[['Cause',selectedItem.data.cause],['Severity',selectedItem.data.severity],['Road',selectedItem.data.road],['Source',selectedItem.data.source],
-                    ['Delay',selectedItem.data.delay_sec > 0 ? `${Math.round(selectedItem.data.delay_sec/60)} min` : 'Unknown'],
+                    ['Delay',selectedItem.data.delay_sec >= 60 ? `+${Math.round(selectedItem.data.delay_sec/60)} min` : selectedItem.data.delay_sec > 0 ? '< 1 min' : 'Minimal'],
                     ['Length',selectedItem.data.length_m > 0 ? `${selectedItem.data.length_m}m` : 'Unknown'],
                     ['From',selectedItem.data.from||'—'],['Updated', new Date(selectedItem.data.timestamp).toLocaleTimeString()]
                   ].map(([l,v]) => (

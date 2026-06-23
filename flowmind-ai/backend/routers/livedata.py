@@ -200,16 +200,40 @@ async def fetch_tomtom_incidents() -> list:
                 road = from_street or to_street
             else:
                 road = "Unknown"
+            raw_delay = props.get("delay", 0) or 0
+            raw_length = props.get("length", 0) or 0
+
+            # TomTom often returns delay=0 even for real incidents.
+            # Derive a realistic estimate from road length + magnitude when that happens.
+            if raw_delay == 0 and (raw_length > 0 or magnitude > 0):
+                # Base delay: assume 10 km/h crawl vs 50 km/h normal on affected length
+                # fallback length by magnitude if length also missing
+                eff_length = raw_length if raw_length > 0 else {1: 200, 2: 500, 3: 1000, 4: 2000}.get(magnitude, 300)
+                crawl_speed = {0: 20, 1: 20, 2: 12, 3: 6, 4: 5}.get(magnitude, 15)  # km/h
+                normal_speed = 50  # km/h urban
+                # time_crawl - time_normal in seconds
+                derived_delay = int((eff_length / 1000) / crawl_speed * 3600 - (eff_length / 1000) / normal_speed * 3600)
+                delay_sec = max(derived_delay, 60 * magnitude) if magnitude > 0 else max(derived_delay, 30)
+            else:
+                delay_sec = raw_delay
+
+            sev_label = {0:"Unknown",1:"Minor",2:"Moderate",3:"Major",4:"Undefined"}.get(magnitude, "Unknown")
+            # Upgrade severity if we can tell it's significant
+            if sev_label == "Unknown" and delay_sec > 300:
+                sev_label = "Minor"
+            if sev_label == "Minor" and delay_sec > 900:
+                sev_label = "Moderate"
+
             incidents.append({
                 "id": props.get("id", f"tt-{abs(hash((lat, lng, desc))) % 100000}"),
                 "description": desc,
                 "cause": cause_map.get(icon, "Traffic Incident"),
-                "severity": {0:"Unknown",1:"Minor",2:"Moderate",3:"Major",4:"Undefined"}.get(magnitude, "Unknown"),
+                "severity": sev_label,
                 "magnitude": magnitude,
                 "latitude": lat, "longitude": lng,
                 "from": from_street, "to": to_street,
-                "delay_sec": props.get("delay", 0),
-                "length_m": props.get("length", 0),
+                "delay_sec": delay_sec,
+                "length_m": raw_length,
                 "road": road,
                 "source": "TomTom Live",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
