@@ -26,7 +26,7 @@ logger = logging.getLogger("flowmind.livedata")
 TOMTOM_KEY = os.getenv("TOMTOM_API_KEY", "")
 
 BLR_LAT, BLR_LNG = 12.9716, 77.5946
-BLR_BBOX = "12.7343,77.3791,13.1435,77.8388"
+BLR_BBOX = "77.3791,12.7343,77.8388,13.1435"  # minLon,minLat,maxLon,maxLat (TomTom bbox order)
 
 # ── Module-level caches ───────────────────────────────────────────────────────
 # Shared between requests so the 10-min TTL actually works across calls.
@@ -170,8 +170,8 @@ async def fetch_tomtom_incidents() -> list:
             icon = props.get("iconCategory", 0)
             cause_map = {
                 0:"Unknown", 1:"Accident", 2:"Fog", 3:"Dangerous Conditions", 4:"Rain",
-                5:"Ice", 6:"Queue", 7:"Closed", 8:"Road Works", 9:"Wind", 10:"Flooding",
-                11:"Broken Down Vehicle", 14:"Broken Down Vehicle",
+                5:"Ice", 6:"Traffic Jam", 7:"Lane Closed", 8:"Road Closed", 9:"Road Works",
+                10:"Wind", 11:"Flooding", 12:"Detour", 13:"Cluster", 14:"Broken Down Vehicle",
             }
             incidents.append({
                 "id": props.get("id", f"tt-{abs(hash((lat, lng, desc))) % 100000}"),
@@ -247,8 +247,8 @@ async def _fetch_flow_for_corridor(client: httpx.AsyncClient, corridor: dict):
 
         # Congestion = how much slower than free-flow, as a percentage
         congestion_pct = int(np_clip((1 - current_speed / freeflow_speed) * 100, 0, 99))
-        level = ("Critical" if congestion_pct > 60 else "High" if congestion_pct > 35
-                 else "Moderate" if congestion_pct > 15 else "Free Flow")
+        level = ("Critical" if congestion_pct > 70 else "High" if congestion_pct > 45
+                 else "Moderate" if congestion_pct > 20 else "Free Flow")
 
         # Estimate distance from corridor point spread
         pts_coords = [p.split(",") for p in pts]

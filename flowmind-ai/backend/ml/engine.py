@@ -976,13 +976,6 @@ def estimate_venue_crowd(cap_min: int, cap_max: int) -> int:
     return int(cap_min + (cap_max - cap_min) * np.clip(activity, 0.15, 1.0))
 
 
-
-    if 7 <= h <= 10:  return "morning"
-    if 11 <= h <= 16: return "afternoon"
-    if 17 <= h <= 21: return "evening"
-    return "night"
-
-
 def _hour_to_time_of_day(h: int) -> str:
     if 7 <= h <= 10:  return "morning"
     if 11 <= h <= 16: return "afternoon"

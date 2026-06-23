@@ -254,7 +254,7 @@ export default function CityMap() {
           </div>
         </div>
       )}
-      {apiStatus && mode === 'live' && !apiStatus.simulation_mode && apiStatus.routing_quota_exhausted && (
+      {apiStatus && mode === 'live' && !apiStatus.simulation_mode && apiStatus.flow_quota_exhausted && (
         <div className="flex items-start gap-3 px-4 py-3 rounded-lg border text-xs"
           style={{ background:'rgba(239,68,68,0.08)', borderColor:'rgba(239,68,68,0.3)', color:'var(--text-secondary)' }}>
           <WifiOff size={14} style={{ color:'var(--red)', flexShrink:0, marginTop:1 }} />
