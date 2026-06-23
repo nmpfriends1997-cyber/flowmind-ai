@@ -196,6 +196,17 @@ async def fetch_tomtom_incidents() -> list:
                 5:"Ice", 6:"Traffic Jam", 7:"Lane Closed", 8:"Road Closed", 9:"Road Works",
                 10:"Wind", 11:"Flooding", 12:"Detour", 13:"Cluster", 14:"Broken Down Vehicle",
             }
+            road_numbers = props.get("roadNumbers") or []
+            from_street = (props.get("from") or "").strip()
+            to_street   = (props.get("to") or "").strip()
+            if road_numbers:
+                road = road_numbers[0]
+            elif from_street and to_street and from_street != to_street:
+                road = f"{from_street} → {to_street}"
+            elif from_street or to_street:
+                road = from_street or to_street
+            else:
+                road = "Unknown"
             incidents.append({
                 "id": props.get("id", f"tt-{abs(hash((lat, lng, desc))) % 100000}"),
                 "description": desc,
@@ -203,10 +214,10 @@ async def fetch_tomtom_incidents() -> list:
                 "severity": {0:"Unknown",1:"Minor",2:"Moderate",3:"Major",4:"Undefined"}.get(magnitude, "Unknown"),
                 "magnitude": magnitude,
                 "latitude": lat, "longitude": lng,
-                "from": props.get("from", ""), "to": props.get("to", ""),
+                "from": from_street, "to": to_street,
                 "delay_sec": props.get("delay", 0),
                 "length_m": props.get("length", 0),
-                "road": (props.get("roadNumbers") or ["Unknown"])[0],
+                "road": road,
                 "source": "TomTom Live",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
