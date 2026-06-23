@@ -658,6 +658,18 @@ def _hourly_forecast_ml(models: dict, event_cause: str, time_of_day: str,
 
     # Blend ML + historical shape
     preds = ml_preds * 0.6 + hist_shape * ml_preds.mean() * 0.4
+    preds = np.clip(preds, 0, None)
+
+    # Day/night envelope — congestion should always taper down to ~0 at the
+    # start (midnight, hour 0) and back down again by the end (hour 23),
+    # instead of whichever hour happens to have the lowest raw ML value.
+    # Using a period of 23 (not 24) makes hour 0 AND hour 23 both land
+    # exactly on the trough of the cosine, so the curve always begins and
+    # ends at zero, with the hump shape (driven by ml_preds/hist_shape)
+    # preserved in between.
+    hours    = np.arange(24)
+    envelope = (1 - np.cos(2 * np.pi * hours / 23)) / 2
+    preds    = preds * envelope
 
     # Crowd-size broadening: larger crowds sustain congestion longer.
     # We apply a Gaussian-like smoothing kernel whose width grows with crowd.
@@ -667,8 +679,12 @@ def _hourly_forecast_ml(models: dict, event_cause: str, time_of_day: str,
         kernel = np.ones(kernel_width * 2 + 1) / (kernel_width * 2 + 1)
         preds = np.convolve(preds, kernel, mode="same")
 
-    # Shift to zero, scale to peak
-    preds = preds - preds.min()
+    # Re-anchor the endpoints to exactly 0 (convolution can leak a sliver of
+    # the neighbouring hour's value into hour 0 / hour 23), then scale so the
+    # peak hour matches the predicted overall peak_congestion.
+    preds[0] = 0.0
+    preds[-1] = 0.0
+    preds = np.clip(preds, 0, None)
     if preds.max() > 0:
         preds = preds / preds.max() * peak_congestion
 
