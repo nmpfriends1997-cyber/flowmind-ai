@@ -5,10 +5,22 @@ APIs used:
   - TomTom Traffic Incidents  (/traffic/services/5/incidentDetails) — your key works
   - TomTom Flow Segment Data  (/traffic/services/4/flowSegmentData) — free, same key,
     gives current speed + free-flow speed per road segment, no Routing API needed
-  - OpenStreetMap Overpass    — free, no key, real venue data
+  - TomTom Search — Category Search (/search/2/categorySearch/) — same key, free
+    tier, real POI/venue data (malls, stadiums, temples, etc.) from TomTom's own
+    database. This is the primary venue source — far more reliable than public
+    Overpass mirrors, which were timing out/406-ing constantly.
+  - OpenStreetMap Overpass — free, no key — kept ONLY as a last-resort fallback
+    if TomTom Search returns nothing (e.g. key/quota issue).
 
 TomTom Routing API is NOT used — it requires a separate paid product on your key (403).
 Instead we use the Flow API which IS included in the free Traffic tier.
+
+IMPORTANT CAVEAT (carried over from the OSM venue design, still true for TomTom
+Search): this returns real PLACES (malls, stadiums, temples, theatres, etc.),
+not a live calendar of scheduled events. There is currently no free, India-
+covering "what's actually happening today" events API — see project notes.
+The crowd_estimate on each venue is a simulated plausible-range estimate, not
+a real attendance figure for an actual scheduled event.
 """
 
 import httpx, os, asyncio, math, logging
@@ -32,6 +44,12 @@ _corridor_cache: list = []
 _corridor_cache_time: datetime | None = None
 CORRIDOR_CACHE_TTL = 900   # 15 minutes → 26 corridors x 96 refreshes/day = 2,496 calls/day
 
+_venue_cache: list = []
+_venue_cache_time: datetime | None = None
+VENUE_CACHE_TTL = 900   # 15 minutes — venues barely change; keeps TomTom Search
+                         # calls well inside the free daily quota regardless of
+                         # how often the frontend polls live-snapshot.
+
 # ── TomTom quota backoff ──────────────────────────────────────────────────────
 _flow_quota_exhausted_date: date | None = None
 
@@ -51,7 +69,98 @@ def _mark_flow_quota_exhausted() -> None:
 def np_clip(v, lo, hi):
     return max(lo, min(hi, v))
 
-# ── Overpass — real OSM venue data ───────────────────────────────────────────
+# ── TomTom Search (Category Search) — primary venue source ───────────────────
+# Real POI data straight from TomTom's own database — same key/account as the
+# traffic calls above, no extra signup. Far more reliable than the public
+# Overpass mirrors (no 406s, no multi-mirror retries, no random timeouts).
+# Each entry: (search query text, event_type label, (crowd_lo, crowd_hi)).
+TOMTOM_VENUE_QUERIES = [
+    ("shopping mall",      "Public Gathering", (2000, 20000)),
+    ("stadium",            "Sports Event",      (5000, 50000)),
+    ("place of worship",   "Religious Event",   (500, 10000)),
+    ("university",         "Academic Event",    (1000, 8000)),
+    ("hospital",           "Emergency Zone",    (200, 1000)),
+    ("movie theater",      "Public Event",      (100, 1500)),
+    ("theatre",            "Cultural Event",    (200, 2000)),
+    ("tourist attraction", "Tourist Event",     (500, 5000)),
+]
+TOMTOM_VENUE_RADIUS_M = 25000   # ~25km — covers greater Bangalore from BLR_LAT/LNG
+TOMTOM_VENUE_LIMIT    = 10      # per category, per cycle
+
+async def _tomtom_category_search(client: httpx.AsyncClient, query: str) -> list:
+    url = f"https://api.tomtom.com/search/2/categorySearch/{query}.json"
+    try:
+        resp = await client.get(url, params={
+            "key": TOMTOM_KEY, "lat": BLR_LAT, "lon": BLR_LNG,
+            "radius": TOMTOM_VENUE_RADIUS_M, "limit": TOMTOM_VENUE_LIMIT,
+        })
+        if resp.status_code != 200:
+            logger.warning("TomTom categorySearch(%s) returned HTTP %s: %s",
+                            query, resp.status_code, resp.text[:200])
+            return []
+        return resp.json().get("results", [])
+    except Exception as e:
+        logger.warning("TomTom categorySearch(%s) failed: %s: %r", query, type(e).__name__, e)
+        return []
+
+async def fetch_tomtom_venues() -> list:
+    """
+    Real venue/POI data from TomTom Search, cached for VENUE_CACHE_TTL so a
+    60s-polling frontend doesn't burn through the daily free quota. Falls
+    back to fetch_osm_venues() (Overpass) only if TomTom returns nothing at
+    all for this cycle — e.g. no TOMTOM_API_KEY configured, or a quota/auth
+    issue on the Search product specifically.
+    """
+    global _venue_cache, _venue_cache_time
+    now = datetime.now(timezone.utc)
+    if _venue_cache and _venue_cache_time and (now - _venue_cache_time).total_seconds() < VENUE_CACHE_TTL:
+        return _venue_cache
+
+    if not TOMTOM_KEY:
+        logger.warning("No TOMTOM_API_KEY configured — falling back to Overpass for venues.")
+        return await fetch_osm_venues()
+
+    async with httpx.AsyncClient(timeout=6) as client:
+        results_by_query = await asyncio.gather(
+            *[_tomtom_category_search(client, q) for q, _, _ in TOMTOM_VENUE_QUERIES]
+        )
+
+    venues = []
+    seen_ids = set()
+    for (query, event_type, cap_range), results in zip(TOMTOM_VENUE_QUERIES, results_by_query):
+        for r in results:
+            poi = r.get("poi", {})
+            pos = r.get("position", {})
+            name = poi.get("name")
+            if not name or r.get("id") in seen_ids:
+                continue
+            seen_ids.add(r.get("id"))
+            crowd_est = ml_estimate_venue_crowd(*cap_range)
+            risk = "High" if crowd_est > 10000 else "Moderate" if crowd_est > 3000 else "Low"
+            venues.append({
+                "id": f"tomtom-{r.get('id', name)}",
+                "name": name,
+                "event_type": event_type,
+                "amenity": query,
+                "latitude": pos.get("lat", BLR_LAT),
+                "longitude": pos.get("lon", BLR_LNG),
+                "crowd_estimate": crowd_est,
+                "risk_level": risk,
+                "source": "TomTom (Live)",
+                "timestamp": now.isoformat(),
+            })
+
+    if not venues:
+        logger.warning("TomTom Search returned 0 venues this cycle — falling back to Overpass.")
+        return await fetch_osm_venues()
+
+    logger.info("TomTom Search returned %d venues across %d categories.",
+                len(venues), len(TOMTOM_VENUE_QUERIES))
+    venues = venues[:60]
+    _venue_cache, _venue_cache_time = venues, now
+    return venues
+
+# ── Overpass — real OSM venue data (fallback only) ────────────────────────────
 # The public Overpass instances are notoriously flaky under load (504s, 429s)
 # and overpass-api.de's Apache front-end specifically returns 406 Not
 # Acceptable if it sees an Accept/Accept-Encoding header it doesn't like —
@@ -500,7 +609,7 @@ async def google_traffic():
 
 @router.get("/live-events")
 async def live_events():
-    data = await fetch_osm_venues()
+    data = await fetch_tomtom_venues()
     return {"count": len(data), "source": data[0]["source"] if data else "none", "events": data}
 
 @router.get("/live-snapshot")
@@ -508,7 +617,7 @@ async def live_snapshot():
     incidents, traffic, events = await asyncio.gather(
         fetch_tomtom_incidents(),
         fetch_google_traffic(),
-        fetch_osm_venues(),
+        fetch_tomtom_venues(),
     )
     critical = sum(1 for t in traffic if t["congestion_level"] == "Critical")
     high_inc  = sum(1 for i in incidents if i.get("magnitude", 0) >= 3)
@@ -539,9 +648,14 @@ async def config_status():
         "simulation_mode": not TOMTOM_KEY,
         "corridor_source": corridor_source,
         "incident_source": "TomTom Live" if TOMTOM_KEY else "ML-predicted",
+        "venue_source": "TomTom Search (Live)" if TOMTOM_KEY else "OpenStreetMap (fallback)",
         "flow_quota_exhausted": _flow_quota_exhausted(),
         "corridor_cache_age_sec": (
             round((datetime.now(timezone.utc) - _corridor_cache_time).total_seconds())
             if _corridor_cache_time else None
+        ),
+        "venue_cache_age_sec": (
+            round((datetime.now(timezone.utc) - _venue_cache_time).total_seconds())
+            if _venue_cache_time else None
         ),
     }
