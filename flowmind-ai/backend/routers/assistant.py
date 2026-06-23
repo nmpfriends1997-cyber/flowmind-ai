@@ -9,7 +9,14 @@ router = APIRouter()
 # ── Get your FREE OpenRouter API key at: https://openrouter.ai ──
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"  # 100% free model
+
+# Free models in priority order — if first fails, next is tried automatically
+FREE_MODELS = [
+    "deepseek/deepseek-r1:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
+    "mistralai/mistral-7b-instruct:free",
+]
 
 
 def get_bangalore_time_context() -> str:
@@ -116,6 +123,29 @@ class ChatRequest(BaseModel):
     history: list = []
 
 
+async def call_openrouter(messages: list, model: str) -> dict:
+    """Call OpenRouter with a specific model and return the raw response data."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 512,
+        "temperature": 0.4,
+        "top_p": 0.9,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://flowmind-ai.app",
+                "X-Title": "FlowMind AI",
+            },
+            json=payload,
+        )
+    return resp.json()
+
+
 @router.post("/chat")
 async def chat(req: ChatRequest):
     if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.startswith("your_"):
@@ -134,38 +164,22 @@ async def chat(req: ChatRequest):
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": req.message})
 
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": messages,
-        "max_tokens": 512,
-        "temperature": 0.4,
-        "top_p": 0.9,
-    }
+    # Try each free model in order until one works
+    last_error = ""
+    for model in FREE_MODELS:
+        try:
+            data = await call_openrouter(messages, model)
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://flowmind-ai.app",
-                    "X-Title": "FlowMind AI",
-                },
-                json=payload,
-            )
+            if "choices" in data and data["choices"]:
+                reply = data["choices"][0]["message"]["content"]
+                return {"reply": reply}
 
-        data = resp.json()
+            # Provider error — try next model
+            last_error = data.get("error", {}).get("message", str(data)) if "error" in data else str(data)
 
-        if "choices" in data and data["choices"]:
-            reply = data["choices"][0]["message"]["content"]
-        elif "error" in data:
-            err = data["error"].get("message", str(data["error"]))
-            reply = f"⚠️ OpenRouter error: {err}"
-        else:
-            reply = f"⚠️ Unexpected response: {data}"
+        except Exception as e:
+            last_error = str(e)
+            continue  # try next model
 
-        return {"reply": reply}
-
-    except Exception as e:
-        return {"reply": f"⚠️ Connection error: {str(e)}"}
+    # All models failed
+    return {"reply": f"⚠️ All models unavailable. Last error: {last_error}"}
