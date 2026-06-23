@@ -8,11 +8,10 @@ router = APIRouter()
 
 # ── Get your FREE Gemini API key at: https://aistudio.google.com/app/apikey ──
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 
 def get_bangalore_time_context() -> str:
-    """Return current IST time and a traffic-level label based on hour."""
     ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     hour = ist.hour
     time_str = ist.strftime("%I:%M %p IST, %A")
@@ -30,10 +29,6 @@ def get_bangalore_time_context() -> str:
 
 
 def build_system_prompt() -> str:
-    """
-    Build the full system prompt: live ML dataset stats + Bangalore traffic
-    domain knowledge + current IST time context.
-    """
     stats       = get_summary_stats()
     causes      = get_cause_distribution()[:6]
     zones       = get_zone_risk()[:3]
@@ -107,8 +102,7 @@ ALTERNATE ROUTES:
 RESPONSE RULES:
 - Always mention whether it is currently peak or off-peak based on the time context
 - Use specific junction and road names — never vague directions
-- Use emoji indicators: SEVERE / MODERATE / CLEAR
-- Reference ML dataset numbers (events, closures, risk zones) when relevant
+- Reference ML dataset numbers when relevant
 - Suggest Namma Metro when it is a viable option
 - Keep responses under 200 words unless a detailed route or breakdown is requested
 - Always recommend cross-checking with Google Maps for real-time GPS conditions
@@ -134,7 +128,6 @@ async def chat(req: ChatRequest):
 
     system_prompt = build_system_prompt()
 
-    # Build Gemini contents array from conversation history
     contents = []
     for h in req.history[-6:]:
         role = "user" if h["role"] == "user" else "model"
@@ -150,13 +143,7 @@ async def chat(req: ChatRequest):
             "maxOutputTokens": 512,
             "temperature": 0.4,
             "topP": 0.9,
-        },
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
+        }
     }
 
     try:
@@ -175,7 +162,7 @@ async def chat(req: ChatRequest):
             err = data["error"].get("message", "Unknown error")
             reply = f"Gemini API error: {err}"
         else:
-            reply = f"Unexpected response from Gemini. Status: {resp.status_code}"
+            reply = f"Unexpected response. Raw: {data}"
 
         return {"reply": reply}
 
