@@ -59,7 +59,13 @@ def np_clip(v, lo, hi):
     return max(lo, min(hi, v))
 
 # ── Overpass — real OSM venue data ───────────────────────────────────────────
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# The public overpass-api.de instance frequently returns 504 under load, so we
+# try it first and fall back to a second public mirror before giving up on
+# live venue data entirely.
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
 OVERPASS_QUERY = """
 [out:json][timeout:25];
 (
@@ -76,57 +82,64 @@ out body 80;
 """
 
 async def fetch_osm_venues() -> list:
-    try:
-        headers = {
-            "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic; flowmind-ai@example.com)",
-            # IMPORTANT: No Accept header — Overpass Apache returns 406 if present.
-            # [out:json] in the query body controls response format instead.
-        }
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY}, headers=headers)
-        if resp.status_code != 200:
-            logger.warning("Overpass returned HTTP %s: %s", resp.status_code, resp.text[:200])
-            return _fallback_events()
-        elements = resp.json().get("elements", [])
-        venues = []
-        for el in elements:
-            tags = el.get("tags", {})
-            name = tags.get("name") or tags.get("name:en", "")
-            if not name:
-                continue
-            amenity = (tags.get("amenity") or tags.get("leisure")
-                       or tags.get("tourism") or tags.get("shop", ""))
-            TYPE_MAP = {
-                "place_of_worship": "Religious Event", "stadium": "Sports Event",
-                "university": "Academic Event",        "hospital": "Emergency Zone",
-                "attraction": "Tourist Event",          "mall": "Public Gathering",
-                "theatre": "Cultural Event",            "cinema": "Public Event",
-            }
-            cap_ranges = {
-                "stadium": (5000, 50000), "mall": (2000, 20000),
-                "place_of_worship": (500, 10000), "university": (1000, 8000),
-                "theatre": (200, 2000), "cinema": (100, 1500),
-                "hospital": (200, 1000), "attraction": (500, 5000),
-            }.get(amenity, (100, 2000))
-            crowd_est = ml_estimate_venue_crowd(*cap_ranges)
-            risk = "High" if crowd_est > 10000 else "Moderate" if crowd_est > 3000 else "Low"
-            venues.append({
-                "id": f"osm-{el['id']}",
-                "name": name,
-                "event_type": TYPE_MAP.get(amenity, "Public Event"),
-                "amenity": amenity,
-                "latitude": el.get("lat", BLR_LAT),
-                "longitude": el.get("lon", BLR_LNG),
-                "crowd_estimate": crowd_est,
-                "risk_level": risk,
-                "source": "OpenStreetMap (Live)",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-        logger.info("Overpass returned %d venues.", len(venues))
-        return venues[:60]
-    except Exception as e:
-        logger.warning("Overpass request failed: %s", e)
-        return _fallback_events()
+    headers = {
+        "User-Agent": "FlowMindAI/1.0 (Bengaluru traffic; flowmind-ai@example.com)",
+        # IMPORTANT: No Accept header — Overpass Apache returns 406 if present.
+        # [out:json] in the query body controls response format instead.
+    }
+    last_error = None
+    for url in OVERPASS_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                resp = await client.post(url, data={"data": OVERPASS_QUERY}, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("Overpass (%s) returned HTTP %s: %s", url, resp.status_code, resp.text[:200])
+                last_error = f"HTTP {resp.status_code}"
+                continue  # try the next mirror instead of giving up immediately
+            elements = resp.json().get("elements", [])
+            venues = []
+            for el in elements:
+                tags = el.get("tags", {})
+                name = tags.get("name") or tags.get("name:en", "")
+                if not name:
+                    continue
+                amenity = (tags.get("amenity") or tags.get("leisure")
+                           or tags.get("tourism") or tags.get("shop", ""))
+                TYPE_MAP = {
+                    "place_of_worship": "Religious Event", "stadium": "Sports Event",
+                    "university": "Academic Event",        "hospital": "Emergency Zone",
+                    "attraction": "Tourist Event",          "mall": "Public Gathering",
+                    "theatre": "Cultural Event",            "cinema": "Public Event",
+                }
+                cap_ranges = {
+                    "stadium": (5000, 50000), "mall": (2000, 20000),
+                    "place_of_worship": (500, 10000), "university": (1000, 8000),
+                    "theatre": (200, 2000), "cinema": (100, 1500),
+                    "hospital": (200, 1000), "attraction": (500, 5000),
+                }.get(amenity, (100, 2000))
+                crowd_est = ml_estimate_venue_crowd(*cap_ranges)
+                risk = "High" if crowd_est > 10000 else "Moderate" if crowd_est > 3000 else "Low"
+                venues.append({
+                    "id": f"osm-{el['id']}",
+                    "name": name,
+                    "event_type": TYPE_MAP.get(amenity, "Public Event"),
+                    "amenity": amenity,
+                    "latitude": el.get("lat", BLR_LAT),
+                    "longitude": el.get("lon", BLR_LNG),
+                    "crowd_estimate": crowd_est,
+                    "risk_level": risk,
+                    "source": "OpenStreetMap (Live)",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            logger.info("Overpass (%s) returned %d venues.", url, len(venues))
+            return venues[:60]
+        except Exception as e:
+            logger.warning("Overpass request to %s failed: %s", url, e)
+            last_error = str(e)
+            continue  # try the next mirror
+
+    logger.warning("All Overpass endpoints failed (%s) — using ML fallback.", last_error)
+    return _fallback_events()
 
 # ── TomTom Traffic Incidents ──────────────────────────────────────────────────
 async def fetch_tomtom_incidents() -> list:
