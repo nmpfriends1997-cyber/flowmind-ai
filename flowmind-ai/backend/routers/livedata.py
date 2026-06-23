@@ -14,7 +14,11 @@ Instead we use the Flow API which IS included in the free Traffic tier.
 import httpx, os, asyncio, math, logging
 from fastapi import APIRouter
 from datetime import datetime, timezone, date
-from ml.engine import estimate_venue_crowd as ml_estimate_venue_crowd
+from ml.engine import (
+    predict_corridor_congestion_now as ml_predict_corridor_now,
+    sample_live_incidents as ml_sample_live_incidents,
+    estimate_venue_crowd as ml_estimate_venue_crowd,
+)
 
 router = APIRouter()
 logger = logging.getLogger("flowmind.livedata")
@@ -30,7 +34,11 @@ BLR_BBOX = "77.3791,12.7343,77.8388,13.1435"  # minLon,minLat,maxLon,maxLat (Tom
 #  wasn't working before.)
 _corridor_cache: list = []
 _corridor_cache_time: datetime | None = None
-CORRIDOR_CACHE_TTL = 900   # 15 minutes → 26 corridors x 96 refreshes/day = 2,496 calls/day
+CORRIDOR_CACHE_TTL = 600   # 10 minutes → 7 × 144 = 1,008 flow calls/day
+
+_ml_traffic_cache: list = []
+_ml_traffic_cache_time: datetime | None = None
+ML_CACHE_TTL = 600
 
 # ── TomTom quota backoff ──────────────────────────────────────────────────────
 _flow_quota_exhausted_date: date | None = None
@@ -43,8 +51,7 @@ def _mark_flow_quota_exhausted() -> None:
     today = datetime.now(timezone.utc).date()
     if _flow_quota_exhausted_date != today:
         logger.warning(
-            "TomTom Flow API daily quota exhausted — serving last cached real "
-            "corridor data (if any) until quota resets at midnight UTC (%s).", today
+            "TomTom Flow API daily quota exhausted — ML fallback until midnight UTC (%s).", today
         )
     _flow_quota_exhausted_date = today
 
@@ -141,13 +148,13 @@ async def fetch_osm_venues() -> list:
             last_error = f"{type(e).__name__}: {e}"
             continue  # try the next mirror
 
-    logger.warning("All Overpass endpoints failed (%s) — no live venue data this cycle.", last_error)
-    return []
+    logger.warning("All Overpass endpoints failed (%s) — using ML fallback.", last_error)
+    return _fallback_events()
 
 # ── TomTom Traffic Incidents ──────────────────────────────────────────────────
 async def fetch_tomtom_incidents() -> list:
     if not TOMTOM_KEY:
-        return []
+        return _fallback_incidents()
     fields = (
         "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,"
         "magnitudeOfDelay,events{description,code,iconCategory},startTime,endTime,"
@@ -167,7 +174,7 @@ async def fetch_tomtom_incidents() -> list:
             )
         if resp.status_code != 200:
             logger.warning("TomTom Incidents HTTP %s: %s", resp.status_code, resp.text[:200])
-            return []
+            return _fallback_incidents()
         incidents = []
         for inc in resp.json().get("incidents", [])[:50]:
             props = inc.get("properties", {})
@@ -220,7 +227,7 @@ async def fetch_tomtom_incidents() -> list:
         return incidents
     except Exception as e:
         logger.warning("TomTom Incidents request failed: %s", e)
-        return []
+        return _fallback_incidents()
 
 # ── TomTom Flow Segment Data — replaces Routing API ─────────────────────────
 # Flow API (/traffic/services/4/flowSegmentData/absolute/10/json) is included
@@ -228,42 +235,18 @@ async def fetch_tomtom_incidents() -> list:
 # It returns currentSpeed + freeFlowSpeed for a road point, giving us a real
 # congestion ratio without needing the Routing product (which caused 403).
 #
-# One call per corridor midpoint. With 26 corridors at a 15-min cache TTL,
-# that's 26 x 96 refreshes/day = 2,496 calls/day — just inside TomTom's free
-# 2,500/day Traffic tier limit.
+# One call per corridor midpoint → 7 calls per refresh.
 
 TOMTOM_FLOW_URL = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
 
 BENGALURU_CORRIDORS = [
-    # Major arterial roads (radial, in/out of the city)
-    {"name": "Outer Ring Road",        "points": "12.9352,77.6245|12.9716,77.6412|12.9933,77.6897"},
-    {"name": "Mysore Road",            "points": "12.9523,77.5150|12.9411,77.4852|12.9305,77.4601"},
-    {"name": "Bellary Road",           "points": "13.0240,77.5946|13.0578,77.5870|13.0950,77.5780"},
-    {"name": "Hosur Road",             "points": "12.9270,77.6210|12.8910,77.6401|12.8550,77.6602"},
-    {"name": "Old Madras Road",        "points": "12.9858,77.6412|13.0100,77.6601|13.0350,77.6920"},
-    {"name": "Tumkur Road",            "points": "13.0240,77.5480|13.0550,77.5120|13.0850,77.4850"},
-    {"name": "Bannerghatta Road",      "points": "12.9050,77.5946|12.8650,77.5946|12.8250,77.5946"},
-    {"name": "Sarjapur Road",          "points": "12.9095,77.6700|12.8990,77.6950|12.8850,77.7200"},
-    {"name": "Old Airport Road",       "points": "12.9620,77.6280|12.9580,77.6450|12.9540,77.6620"},
-    {"name": "Kanakapura Road",        "points": "12.9200,77.5600|12.8800,77.5500|12.8400,77.5400"},
-    {"name": "Magadi Road",            "points": "12.9750,77.5550|12.9850,77.5300|12.9950,77.5050"},
-    {"name": "Whitefield Main Road",   "points": "12.9750,77.7100|12.9700,77.7350|12.9690,77.7500"},
-    {"name": "Nice Road",              "points": "12.8700,77.5200|12.8500,77.5400|12.8300,77.5600"},
-    # Known congestion hotspots / junctions
-    {"name": "Silk Board Junction",    "points": "12.9180,77.6235|12.9170,77.6230|12.9160,77.6225"},
-    {"name": "Marathahalli Bridge",    "points": "12.9580,77.7000|12.9560,77.6990|12.9540,77.6980"},
-    {"name": "KR Puram",               "points": "13.0050,77.6950|13.0030,77.6960|13.0010,77.6970"},
-    {"name": "Electronic City Flyover","points": "12.8450,77.6650|12.8400,77.6600|12.8350,77.6550"},
-    {"name": "Hebbal Flyover",         "points": "13.0350,77.5970|13.0380,77.6000|13.0410,77.6030"},
-    # Central / inner-city roads
-    {"name": "MG Road",                "points": "12.9759,77.6055|12.9740,77.6090|12.9720,77.6130"},
-    {"name": "Indiranagar 100 Feet Road","points": "12.9720,77.6400|12.9760,77.6420|12.9800,77.6440"},
-    {"name": "Koramangala 80 Feet Road","points": "12.9350,77.6150|12.9320,77.6200|12.9290,77.6250"},
-    {"name": "JP Nagar – Bannerghatta Junction","points": "12.9080,77.5850|12.8950,77.5900|12.8820,77.5950"},
-    {"name": "Yeshwantpur",            "points": "13.0250,77.5450|13.0280,77.5400|13.0310,77.5350"},
-    {"name": "Rajajinagar (Dr Rajkumar Road)","points": "12.9900,77.5500|12.9950,77.5550|13.0000,77.5600"},
-    {"name": "Malleshwaram (Sampige Road)","points": "13.0050,77.5700|13.0080,77.5750|13.0110,77.5800"},
-    {"name": "Vijayanagar (West of Chord Road)","points": "12.9650,77.5300|12.9620,77.5350|12.9590,77.5400"},
+    {"name": "Outer Ring Road",   "points": "12.9352,77.6245|12.9716,77.6412|12.9933,77.6897"},
+    {"name": "Mysore Road",       "points": "12.9523,77.5150|12.9411,77.4852|12.9305,77.4601"},
+    {"name": "Bellary Road",      "points": "13.0240,77.5946|13.0578,77.5870|13.0950,77.5780"},
+    {"name": "Hosur Road",        "points": "12.9270,77.6210|12.8910,77.6401|12.8550,77.6602"},
+    {"name": "Old Madras Road",   "points": "12.9858,77.6412|13.0100,77.6601|13.0350,77.6920"},
+    {"name": "Tumkur Road",       "points": "13.0240,77.5480|13.0550,77.5120|13.0850,77.4850"},
+    {"name": "Bannerghatta Road", "points": "12.9050,77.5946|12.8650,77.5946|12.8250,77.5946"},
 ]
 
 async def _fetch_flow_for_corridor(client: httpx.AsyncClient, corridor: dict):
@@ -331,18 +314,14 @@ async def _fetch_flow_for_corridor(client: httpx.AsyncClient, corridor: dict):
 async def fetch_google_traffic() -> list:
     """
     Function name kept unchanged so no other file needs editing.
-    Uses TomTom Flow Segment API (free tier, same key as incidents).
-    Results cached 15 minutes to stay within the 2,500 req/day limit.
-
-    This never fabricates corridor numbers. If TomTom is unreachable or no
-    key is configured, it returns the last real cached result (clearly
-    stale, but genuine) if one exists, or an empty list if it doesn't —
-    never a simulated/ML-predicted value.
+    Now uses TomTom Flow Segment API (free tier, same key as incidents).
+    Results cached 10 minutes to stay within the 2,500 req/day limit.
     """
     global _corridor_cache, _corridor_cache_time
 
     if not TOMTOM_KEY:
-        return []
+        logger.info("No TomTom key — using ML fallback for corridors.")
+        return _fallback_google_traffic()
 
     # Serve from cache if still fresh (this actually works now — module-level var)
     if _corridor_cache and _corridor_cache_time:
@@ -351,9 +330,7 @@ async def fetch_google_traffic() -> list:
             return _corridor_cache
 
     if _flow_quota_exhausted():
-        # Quota exhausted: serve the last real cached reading (now stale) if
-        # we have one, rather than nothing or a fabricated value.
-        return _corridor_cache
+        return _fallback_google_traffic()
 
     async with httpx.AsyncClient(timeout=8) as client:
         results = await asyncio.gather(
@@ -362,13 +339,12 @@ async def fetch_google_traffic() -> list:
     results = [r for r in results if r is not None]
 
     if not results:
-        logger.info("TomTom Flow: all requests failed this cycle — serving last real cache (if any).")
-        return _corridor_cache
+        logger.info("TomTom Flow: all requests failed — using ML fallback.")
+        return _fallback_google_traffic()
 
     _corridor_cache = results
     _corridor_cache_time = datetime.now(timezone.utc)
-    logger.info("TomTom Flow: fetched %d/%d corridors, cached for %ds.",
-                len(results), len(BENGALURU_CORRIDORS), CORRIDOR_CACHE_TTL)
+    logger.info("TomTom Flow: fetched %d corridors, cached for %ds.", len(results), CORRIDOR_CACHE_TTL)
     return results
 
 # ── ML fallbacks — stable, cached, not random ────────────────────────────────
