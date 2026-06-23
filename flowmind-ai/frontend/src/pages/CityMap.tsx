@@ -5,7 +5,7 @@ import {
   fetchHeatmap, fetchRecentEvents,
   fetchLiveSnapshot, fetchApiConfigStatus
 } from '../lib/api'
-import { Panel, PanelHeader, RiskBadge, Spinner } from '../components/UI'
+import { Panel, PanelHeader, Spinner } from '../components/UI'
 import { RefreshCw, Wifi, WifiOff, Database, Radio, AlertTriangle, Navigation } from 'lucide-react'
 
 const CAUSE_COLORS: Record<string,string> = {
@@ -22,14 +22,68 @@ const SEV_COLOR: Record<string,string> = {
   Critical:'#EF4444', Major:'#F97316', Moderate:'#F59E0B', Minor:'#10B981', Unknown:'#94A3B8'
 }
 
+function safeTime(ts: string | undefined | null): string {
+  if (!ts) return '—'
+  const d = new Date(ts)
+  return isNaN(d.getTime()) ? '—' : d.toLocaleTimeString('en-IN', { hour12: false })
+}
+
+function safeDelay(sec: number | undefined | null): string {
+  const n = Number(sec)
+  if (!sec || isNaN(n) || n <= 0) return '—'
+  return `${Math.round(n / 60)} min`
+}
+
 type DataMode = 'historical' | 'live'
 type MapView  = 'heatmap' | 'markers' | 'traffic' | 'incidents' | 'events'
 
+// ── Empty state overlay ───────────────────────────────────────────────────────
+function EmptyMapOverlay({ view, hasKey }: { view: MapView; hasKey: boolean }) {
+  const msgs: Record<string, { icon: string; title: string; sub: string }> = {
+    incidents: {
+      icon: '✅',
+      title: hasKey ? 'No Active Incidents Right Now' : 'TomTom API Key Not Configured',
+      sub: hasKey
+        ? 'TomTom reports zero traffic incidents in Bengaluru at this moment. Check back soon.'
+        : 'Add TOMTOM_API_KEY to backend/.env to see live incidents. Map stays blank — no fake data shown.',
+    },
+    traffic: {
+      icon: hasKey ? '🛣️' : '🔑',
+      title: hasKey ? 'No Corridor Data Available' : 'TomTom API Key Not Configured',
+      sub: hasKey
+        ? 'TomTom Flow returned no corridor data this cycle. Will retry on next refresh.'
+        : 'Add TOMTOM_API_KEY to backend/.env to see live traffic flow.',
+    },
+    events: {
+      icon: '📍',
+      title: 'No Venues Loaded',
+      sub: 'OpenStreetMap Overpass returned no venues. This is free data — try refreshing in a moment.',
+    },
+    heatmap: {
+      icon: '🗺️',
+      title: 'No Data for Heatmap',
+      sub: 'No incidents or corridor data available to generate a heatmap.',
+    },
+    markers: { icon: '', title: '', sub: '' },
+  }
+  const m = msgs[view]
+  if (!m || !m.title) return null
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center z-10 pointer-events-none"
+      style={{ background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(2px)' }}>
+      <div className="text-4xl mb-3">{m.icon}</div>
+      <div className="text-sm font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>{m.title}</div>
+      <div className="text-xs text-center max-w-xs px-4" style={{ color: 'var(--text-secondary)' }}>{m.sub}</div>
+    </div>
+  )
+}
+
 export default function CityMap() {
-  const mapRef         = useRef<HTMLDivElement>(null)
-  const mapInstance    = useRef<any>(null)
-  const layerGroup     = useRef<any>(null)
-  const heatLayer      = useRef<any>(null)
+  const mapRef      = useRef<HTMLDivElement>(null)
+  const mapInstance = useRef<any>(null)
+  const layerGroup  = useRef<any>(null)
+  const heatLayer   = useRef<any>(null)
+  const [mapReady, setMapReady] = useState(false)
 
   const [mode, setMode]           = useState<DataMode>('live')
   const [view, setView]           = useState<MapView>('incidents')
@@ -38,11 +92,9 @@ export default function CityMap() {
   const [lastUpdate, setLastUpdate] = useState<string>('')
   const [apiStatus, setApiStatus] = useState<any>(null)
 
-  // historical
-  const [histPoints, setHistPoints]   = useState<any[]>([])
-  const [histEvents, setHistEvents]   = useState<any[]>([])
+  const [histPoints, setHistPoints] = useState<any[]>([])
+  const [histEvents, setHistEvents] = useState<any[]>([])
 
-  // live
   const [liveIncidents, setLiveIncidents] = useState<any[]>([])
   const [liveTraffic,   setLiveTraffic]   = useState<any[]>([])
   const [liveEvents,    setLiveEvents]    = useState<any[]>([])
@@ -52,8 +104,6 @@ export default function CityMap() {
   const [filter, setFilter]             = useState('all')
 
   // ── Init map ──────────────────────────────────────────────────────────────
-  // L is imported directly as an ES module (see top of file), so there's no
-  // "is window.L ready yet" race — it's available the moment this module loads.
   useEffect(() => {
     if (mapInstance.current || !mapRef.current) return
     const map = L.map(mapRef.current, { center: [12.9716, 77.5946], zoom: 12, zoomControl: true })
@@ -62,20 +112,12 @@ export default function CityMap() {
     }).addTo(map)
     layerGroup.current = L.layerGroup().addTo(map)
     mapInstance.current = map
-    setTimeout(() => map.invalidateSize(), 0)
-
-    return () => {
-      map.remove()
-      mapInstance.current = null
-    }
+    setTimeout(() => { map.invalidateSize(); setMapReady(true) }, 0)
+    return () => { map.remove(); mapInstance.current = null; setMapReady(false) }
   }, [])
 
-  // Re-measure the map whenever the loading skeleton is removed, in case the
-  // container's size changed while it was hidden.
   useEffect(() => {
-    if (!loading && mapInstance.current) {
-      setTimeout(() => mapInstance.current.invalidateSize(), 0)
-    }
+    if (!loading && mapInstance.current) setTimeout(() => mapInstance.current.invalidateSize(), 0)
   }, [loading])
 
   // ── Load data ──────────────────────────────────────────────────────────────
@@ -106,7 +148,6 @@ export default function CityMap() {
     ]).finally(() => setLoading(false))
   }, [])
 
-  // Auto-refresh live every 60s
   useEffect(() => {
     if (mode !== 'live') return
     const id = setInterval(loadLive, 60000)
@@ -116,11 +157,10 @@ export default function CityMap() {
   // ── Render map layers ──────────────────────────────────────────────────────
   useEffect(() => {
     const map = mapInstance.current
-    if (!map || loading) return
+    if (!map || !mapReady || loading) return
 
-    // Clear
     layerGroup.current.clearLayers()
-    if (heatLayer.current) { map.removeLayer(heatLayer.current); heatLayer.current = null }
+    if (heatLayer.current) { try { map.removeLayer(heatLayer.current) } catch(_){} ; heatLayer.current = null }
 
     if (mode === 'historical') {
       const filtered = filter === 'all' ? histPoints : histPoints.filter(p => p.cause === filter)
@@ -132,6 +172,7 @@ export default function CityMap() {
       } else {
         const toShow = filter === 'all' ? histEvents : histEvents.filter(e => e.event_cause === filter)
         toShow.slice(0, 200).forEach(e => {
+          if (!e.latitude || !e.longitude) return
           const color = CAUSE_COLORS[e.event_cause] || '#94A3B8'
           const icon = L.divIcon({
             html: `<div style="width:10px;height:10px;border-radius:50%;background:${color};border:2px solid rgba(255,255,255,0.3);box-shadow:0 0 6px ${color}80"></div>`,
@@ -144,76 +185,95 @@ export default function CityMap() {
       }
 
     } else {
-      // ── LIVE modes ────────────────────────────────────────────────────────
+      // ── LIVE ──────────────────────────────────────────────────────────────
       if (view === 'incidents') {
-        liveIncidents.forEach(inc => {
+        liveIncidents.forEach((inc, idx) => {
+          const lat = Number(inc.latitude), lng = Number(inc.longitude)
+          if (!lat || !lng || isNaN(lat) || isNaN(lng)) return
           const color = SEV_COLOR[inc.severity] || '#94A3B8'
           const size  = inc.magnitude >= 3 ? 14 : inc.magnitude >= 2 ? 11 : 8
           const icon = L.divIcon({
-            html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:${color};border:2px solid rgba(255,255,255,0.5);box-shadow:0 0 8px ${color}90;animation:pulse-glow 2s infinite"></div>`,
+            html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:${color};border:2px solid rgba(255,255,255,0.5);box-shadow:0 0 8px ${color}90"></div>`,
             className: '', iconSize: [size,size],
           })
-          L.marker([inc.latitude, inc.longitude], { icon })
-            .on('click', () => setSelectedItem({ type:'incident', data:inc }))
-            .bindTooltip(`<b>${inc.cause}</b><br/>${inc.road}<br/>Delay: ${Math.round(inc.delay_sec/60)} min`, { permanent:false })
+          const delay = inc.delay_sec > 0 ? `Delay: ${Math.round(inc.delay_sec / 60)} min` : 'No delay reported'
+          L.marker([lat, lng], { icon })
+            .on('click', () => setSelectedItem({ type:'incident', idx, data:inc }))
+            .bindTooltip(`<b>${inc.cause || 'Incident'}</b><br/>${inc.road || ''}<br/>${delay}`, { permanent:false })
             .addTo(layerGroup.current)
         })
 
       } else if (view === 'traffic') {
-        liveTraffic.forEach(t => {
+        liveTraffic.forEach((t, idx) => {
+          const lat = Number(t.latitude), lng = Number(t.longitude)
+          if (!lat || !lng || isNaN(lat) || isNaN(lng)) return
           const color = CONGESTION_COLOR(t.congestion_pct)
           const r = 14 + Math.round(t.congestion_pct / 10)
           const icon = L.divIcon({
             html: `<div style="width:${r*2}px;height:${r*2}px;border-radius:50%;background:${color}22;border:2px solid ${color};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:${color}">${t.congestion_pct}%</div>`,
             className: '', iconSize: [r*2, r*2], iconAnchor: [r, r],
           })
-          L.marker([t.latitude, t.longitude], { icon })
-            .on('click', () => setSelectedItem({ type:'traffic', data:t }))
+          L.marker([lat, lng], { icon })
+            .on('click', () => setSelectedItem({ type:'traffic', idx, data:t }))
             .bindTooltip(`<b>${t.corridor}</b><br/>Congestion: ${t.congestion_pct}%<br/>Delay: +${t.delay_min} min`, { permanent:false })
             .addTo(layerGroup.current)
         })
 
       } else if (view === 'events') {
-        liveEvents.forEach(ev => {
+        liveEvents.forEach((ev, idx) => {
+          const lat = Number(ev.latitude), lng = Number(ev.longitude)
+          if (!lat || !lng || isNaN(lat) || isNaN(lng)) return
           const color = ev.risk_level === 'High' ? '#EF4444' : ev.risk_level === 'Moderate' ? '#F59E0B' : '#10B981'
           const size  = ev.crowd_estimate > 10000 ? 16 : ev.crowd_estimate > 3000 ? 12 : 9
           const icon = L.divIcon({
             html: `<div style="width:${size}px;height:${size+3}px;clip-path:polygon(50% 0%,100% 40%,80% 100%,20% 100%,0% 40%);background:${color};border:2px solid white;box-shadow:0 0 8px ${color}80"></div>`,
             className: '', iconSize: [size, size+3], iconAnchor: [size/2, size+3],
           })
-          L.marker([ev.latitude, ev.longitude], { icon })
-            .on('click', () => setSelectedItem({ type:'event', data:ev }))
+          L.marker([lat, lng], { icon })
+            .on('click', () => setSelectedItem({ type:'event', idx, data:ev }))
             .bindTooltip(`<b>${ev.name||ev.event_type}</b><br/>Crowd: ~${(ev.crowd_estimate||0).toLocaleString()}<br/>Risk: ${ev.risk_level}`, { permanent:false })
             .addTo(layerGroup.current)
         })
 
       } else if (view === 'heatmap' && (L as any).heatLayer) {
-        // Live heatmap — blend incidents + congestion
         const pts = [
-          ...liveIncidents.map(i => [i.latitude, i.longitude, i.magnitude / 4]),
-          ...liveTraffic.map(t => [t.latitude, t.longitude, t.congestion_pct / 100]),
+          ...liveIncidents.filter(i => i.latitude && i.longitude).map(i => [Number(i.latitude), Number(i.longitude), (i.magnitude||1) / 4]),
+          ...liveTraffic.filter(t => t.latitude && t.longitude).map(t => [Number(t.latitude), Number(t.longitude), t.congestion_pct / 100]),
         ]
-        heatLayer.current = (L as any).heatLayer(pts, {
-          radius:28, blur:18, maxZoom:17,
-          gradient:{'0.2':'#3B82F6','0.5':'#F59E0B','0.8':'#F97316','1.0':'#EF4444'}
-        }).addTo(map)
+        if (pts.length > 0) {
+          heatLayer.current = (L as any).heatLayer(pts, {
+            radius:28, blur:18, maxZoom:17,
+            gradient:{'0.2':'#3B82F6','0.5':'#F59E0B','0.8':'#F97316','1.0':'#EF4444'}
+          }).addTo(map)
+        }
       }
     }
-  }, [mode, view, filter, histPoints, histEvents, liveIncidents, liveTraffic, liveEvents, loading])
+  }, [mode, view, filter, histPoints, histEvents, liveIncidents, liveTraffic, liveEvents, loading, mapReady])
 
-  // ── Sidebar items ──────────────────────────────────────────────────────────
+  // ── Derived state ──────────────────────────────────────────────────────────
+  const hasKey = apiStatus ? !apiStatus.simulation_mode : true
+
+  // Is the current live view actually empty (no real data)?
+  const liveViewEmpty = mode === 'live' && !loading && (
+    (view === 'incidents' && liveIncidents.length === 0) ||
+    (view === 'traffic'   && liveTraffic.length === 0) ||
+    (view === 'events'    && liveEvents.length === 0) ||
+    (view === 'heatmap'   && liveIncidents.length === 0 && liveTraffic.length === 0)
+  )
+
   const sidebarItems = mode === 'historical'
     ? histEvents.slice(0, 12)
     : view === 'incidents' ? liveIncidents.slice(0, 12)
     : view === 'traffic'   ? liveTraffic.slice(0, 12)
-    : liveEvents.slice(0, 12)
+    : view === 'events'    ? liveEvents.slice(0, 12)
+    : liveIncidents.slice(0, 12)
 
   const historicalCauses = ['all', ...Array.from(new Set(histPoints.map(p => p.cause))).sort()]
 
   const LIVE_VIEWS: { key: MapView; label: string; icon: any }[] = [
-    { key:'incidents', label:'Incidents', icon: AlertTriangle },
+    { key:'incidents', label:'Incidents',        icon: AlertTriangle },
     { key:'traffic',   label:'Corridor Traffic', icon: Navigation },
-    { key:'events',    label:'Live Events', icon: Radio },
+    { key:'events',    label:'Live Events',      icon: Radio },
     { key:'heatmap',   label:'Combined Heatmap', icon: Database },
   ]
 
@@ -224,8 +284,6 @@ export default function CityMap() {
           <h1 className="text-lg font-semibold" style={{ color:'var(--text-primary)' }}>City Map</h1>
           <p className="text-sm" style={{ color:'var(--text-secondary)' }}>Bengaluru traffic intelligence — real-time + historical</p>
         </div>
-
-        {/* Mode toggle */}
         <div className="flex items-center gap-2 p-1 rounded-xl border" style={{ background:'var(--bg-panel)', borderColor:'var(--border)' }}>
           {(['historical','live'] as DataMode[]).map(m => (
             <button key={m} onClick={() => { setMode(m); setView(m === 'historical' ? 'heatmap' : 'incidents') }}
@@ -241,48 +299,48 @@ export default function CityMap() {
         </div>
       </div>
 
-      {/* API key status banners — one per data source so the user knows exactly what is live vs ML */}
+      {/* ── Status banners ── */}
       {apiStatus && mode === 'live' && apiStatus.simulation_mode && (
         <div className="flex items-start gap-3 px-4 py-3 rounded-lg border text-xs"
-          style={{ background:'rgba(245,158,11,0.08)', borderColor:'rgba(245,158,11,0.3)', color:'var(--text-secondary)' }}>
-          <WifiOff size={14} style={{ color:'var(--amber)', flexShrink:0, marginTop:1 }} />
+          style={{ background:'rgba(239,68,68,0.08)', borderColor:'rgba(239,68,68,0.3)', color:'var(--text-secondary)' }}>
+          <WifiOff size={14} style={{ color:'#EF4444', flexShrink:0, marginTop:1 }} />
           <div>
-            <span style={{ color:'var(--amber)', fontWeight:600 }}>Simulation Mode — </span>
-            No API key detected. Incidents and corridor traffic are ML-predicted from historical Bengaluru data (not random).
-            Add <code style={{ color:'var(--blue)' }}>TOMTOM_API_KEY</code> to <code>backend/.env</code> for real live data.
-            Events are always real (OpenStreetMap).
+            <span style={{ color:'#EF4444', fontWeight:600 }}>No TomTom API Key — </span>
+            Incidents and corridor traffic will not be shown. The map intentionally stays blank rather than showing
+            fabricated data. Add <code style={{ color:'var(--blue)' }}>TOMTOM_API_KEY</code> to{' '}
+            <code>backend/.env</code> and restart the server.{' '}
+            <span style={{ color:'var(--text-muted)' }}>Live Events (OpenStreetMap) are still shown.</span>
           </div>
         </div>
       )}
       {apiStatus && mode === 'live' && !apiStatus.simulation_mode && apiStatus.flow_quota_exhausted && (
         <div className="flex items-start gap-3 px-4 py-3 rounded-lg border text-xs"
-          style={{ background:'rgba(239,68,68,0.08)', borderColor:'rgba(239,68,68,0.3)', color:'var(--text-secondary)' }}>
-          <WifiOff size={14} style={{ color:'var(--red)', flexShrink:0, marginTop:1 }} />
+          style={{ background:'rgba(245,158,11,0.08)', borderColor:'rgba(245,158,11,0.3)', color:'var(--text-secondary)' }}>
+          <WifiOff size={14} style={{ color:'var(--amber)', flexShrink:0, marginTop:1 }} />
           <div>
-            <span style={{ color:'var(--red)', fontWeight:600 }}>Corridor Quota Exhausted — </span>
-            TomTom Routing daily limit reached. Corridor traffic is showing ML-predicted data until midnight UTC.
-            Incidents and Events are still live.
+            <span style={{ color:'var(--amber)', fontWeight:600 }}>TomTom Flow Quota Exhausted — </span>
+            Daily corridor limit reached. Showing last real cached reading.
+            Incidents and Events are still live. Quota resets at midnight UTC.
           </div>
         </div>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        {/* Left panel */}
+        {/* ── Left panel ── */}
         <div className="space-y-3">
 
-          {/* Live summary cards */}
           {mode === 'live' && liveSummary && (
             <Panel>
               <PanelHeader title="Live Summary" badge="NOW" badgeColor="live" />
               <div className="p-3 grid grid-cols-2 gap-2">
                 {[
-                  { label:'Incidents',    val: liveSummary.total_incidents,         color:'#EF4444' },
-                  { label:'Critical Roads', val: liveSummary.critical_corridors,     color:'#F97316' },
-                  { label:'Live Events',  val: liveSummary.live_events,             color:'#8B5CF6' },
-                  { label:'Avg Traffic', val: `${liveSummary.avg_congestion_pct}%`, color:'#F59E0B' },
+                  { label:'Incidents',      val: liveSummary.total_incidents,         color:'#EF4444' },
+                  { label:'Critical Roads', val: liveSummary.critical_corridors,      color:'#F97316' },
+                  { label:'Live Events',    val: liveSummary.live_events,             color:'#8B5CF6' },
+                  { label:'Avg Traffic',   val: `${liveSummary.avg_congestion_pct}%`, color:'#F59E0B' },
                 ].map(s => (
                   <div key={s.label} className="p-2 rounded-lg text-center" style={{ background:'var(--bg-elevated)' }}>
-                    <div className="text-lg font-bold font-mono" style={{ color:s.color }}>{s.val}</div>
+                    <div className="text-lg font-bold font-mono" style={{ color:s.color }}>{s.val ?? '—'}</div>
                     <div className="text-[10px]" style={{ color:'var(--text-muted)' }}>{s.label}</div>
                   </div>
                 ))}
@@ -290,7 +348,6 @@ export default function CityMap() {
             </Panel>
           )}
 
-          {/* View mode selector */}
           <Panel>
             <PanelHeader title={mode === 'live' ? 'Live View Mode' : 'Historical View'} />
             <div className="p-3 space-y-1.5">
@@ -345,14 +402,12 @@ export default function CityMap() {
           <Panel>
             <PanelHeader title="Legend" />
             <div className="p-3 space-y-1.5">
-              {mode === 'live' && view === 'incidents' && (
-                Object.entries(SEV_COLOR).map(([k,v]) => (
-                  <div key={k} className="flex items-center gap-2 text-xs">
-                    <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background:v }} />
-                    <span style={{ color:'var(--text-secondary)' }}>{k} Incident</span>
-                  </div>
-                ))
-              )}
+              {mode === 'live' && view === 'incidents' && Object.entries(SEV_COLOR).map(([k,v]) => (
+                <div key={k} className="flex items-center gap-2 text-xs">
+                  <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background:v }} />
+                  <span style={{ color:'var(--text-secondary)' }}>{k} Incident</span>
+                </div>
+              ))}
               {mode === 'live' && view === 'traffic' && (
                 [['#EF4444','Critical (>70%)'],['#F97316','High (45–70%)'],['#F59E0B','Moderate (20–45%)'],['#10B981','Free Flow (<20%)']].map(([c,l]) => (
                   <div key={l} className="flex items-center gap-2 text-xs">
@@ -362,7 +417,7 @@ export default function CityMap() {
                 ))
               )}
               {mode === 'live' && view === 'events' && (
-                [['#EF4444','High Risk (>15k crowd)'],['#F59E0B','Moderate (3–15k)'],['#10B981','Low (<3k)']].map(([c,l]) => (
+                [['#EF4444','High Risk (>10k)'],['#F59E0B','Moderate (3–10k)'],['#10B981','Low (<3k)']].map(([c,l]) => (
                   <div key={l} className="flex items-center gap-2 text-xs">
                     <div className="w-3 h-3 flex-shrink-0" style={{ background:c, clipPath:'polygon(50% 0%,100% 40%,80% 100%,20% 100%,0% 40%)' }} />
                     <span style={{ color:'var(--text-secondary)' }}>{l}</span>
@@ -380,13 +435,12 @@ export default function CityMap() {
             </div>
           </Panel>
 
-          {/* Feed */}
+          {/* Live feed */}
           <Panel>
             <PanelHeader title={mode === 'live' ? '🔴 Live Feed' : 'Recent Events'} badge={mode === 'live' ? 'LIVE' : 'HIST'} badgeColor={mode === 'live' ? 'live' : 'blue'}>
               {mode === 'live' && (
                 <button onClick={loadLive} disabled={refreshing}
-                  className="p-1 rounded cursor-pointer transition-opacity"
-                  style={{ color:'var(--text-muted)', opacity: refreshing ? 0.4 : 1 }}>
+                  className="p-1 rounded cursor-pointer" style={{ color:'var(--text-muted)', opacity: refreshing ? 0.4 : 1 }}>
                   <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
                 </button>
               )}
@@ -397,19 +451,41 @@ export default function CityMap() {
               </div>
             )}
             <div className="p-3 space-y-1.5 max-h-64 overflow-y-auto">
+              {/* Data source label */}
+              {mode === 'live' && sidebarItems.length > 0 && (
+                <div className="text-[10px] px-1 pb-1 flex items-center gap-1" style={{ color:'var(--text-muted)' }}>
+                  {sidebarItems[0]?.source?.includes('TomTom') ? '🛰 TomTom Live' :
+                   sidebarItems[0]?.source?.includes('OpenStreetMap') ? '🗺 OpenStreetMap Live' :
+                   sidebarItems[0]?.source || ''}
+                </div>
+              )}
+
+              {sidebarItems.length === 0 && !loading && mode === 'live' && (
+                <div className="text-xs text-center py-6 space-y-1">
+                  <div style={{ color:'var(--text-muted)' }}>
+                    {hasKey ? 'No data at this moment' : 'API key not configured'}
+                  </div>
+                  {hasKey && (
+                    <button onClick={loadLive} className="text-[10px] underline cursor-pointer" style={{ color:'var(--blue)' }}>
+                      Retry
+                    </button>
+                  )}
+                </div>
+              )}
+
               {sidebarItems.map((item: any, i: number) => {
-                if (mode === 'live' && view === 'incidents') {
+                if (mode === 'live' && (view === 'incidents' || view === 'heatmap')) {
                   const color = SEV_COLOR[item.severity] || '#94A3B8'
                   return (
-                    <div key={i} onClick={() => setSelectedItem({ type:'incident', data:item })}
+                    <div key={i} onClick={() => setSelectedItem({ type:'incident', idx:i, data:item })}
                       className="p-2 rounded-lg border cursor-pointer transition-all hover:border-blue-500/30 text-xs"
-                      style={{ background:'var(--bg-elevated)', borderColor: selectedItem?.data?.id === item.id ? 'rgba(59,130,246,0.4)' : 'var(--border)' }}>
+                      style={{ background:'var(--bg-elevated)', borderColor: selectedItem?.idx === i && selectedItem?.type === 'incident' ? 'rgba(59,130,246,0.4)' : 'var(--border)' }}>
                       <div className="flex items-center gap-2 mb-0.5">
-                        <div className="w-2 h-2 rounded-full flex-shrink-0 animate-pulse-glow" style={{ background:color }} />
-                        <span className="font-semibold truncate" style={{ color:'var(--text-primary)' }}>{item.cause}</span>
-                        <span className="ml-auto text-[10px] font-mono" style={{ color }}>{item.severity}</span>
+                        <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ background:color }} />
+                        <span className="font-semibold truncate" style={{ color:'var(--text-primary)' }}>{item.cause || 'Incident'}</span>
+                        <span className="ml-auto text-[10px] font-mono" style={{ color }}>{item.severity || '—'}</span>
                       </div>
-                      <div className="truncate" style={{ color:'var(--text-secondary)' }}>{item.road}</div>
+                      <div className="truncate" style={{ color:'var(--text-secondary)' }}>{item.road || item.from || '—'}</div>
                       {item.delay_sec > 0 && <div style={{ color:'var(--amber)' }}>+{Math.round(item.delay_sec/60)} min delay</div>}
                     </div>
                   )
@@ -417,9 +493,9 @@ export default function CityMap() {
                 if (mode === 'live' && view === 'traffic') {
                   const color = CONGESTION_COLOR(item.congestion_pct)
                   return (
-                    <div key={i} onClick={() => setSelectedItem({ type:'traffic', data:item })}
+                    <div key={i} onClick={() => setSelectedItem({ type:'traffic', idx:i, data:item })}
                       className="p-2 rounded-lg border cursor-pointer transition-all text-xs"
-                      style={{ background:'var(--bg-elevated)', borderColor:'var(--border)' }}>
+                      style={{ background:'var(--bg-elevated)', borderColor: selectedItem?.idx === i && selectedItem?.type === 'traffic' ? 'rgba(59,130,246,0.4)' : 'var(--border)' }}>
                       <div className="flex items-center justify-between mb-1">
                         <span className="font-semibold text-[11px] truncate pr-2" style={{ color:'var(--text-primary)' }}>{item.corridor}</span>
                         <span className="font-mono font-bold text-[11px] flex-shrink-0" style={{ color }}>{item.congestion_pct}%</span>
@@ -433,9 +509,9 @@ export default function CityMap() {
                 if (mode === 'live' && view === 'events') {
                   const color = item.risk_level === 'High' ? '#EF4444' : item.risk_level === 'Moderate' ? '#F59E0B' : '#10B981'
                   return (
-                    <div key={i} onClick={() => setSelectedItem({ type:'event', data:item })}
+                    <div key={i} onClick={() => setSelectedItem({ type:'event', idx:i, data:item })}
                       className="p-2 rounded-lg border cursor-pointer text-xs"
-                      style={{ background:'var(--bg-elevated)', borderColor:'var(--border)' }}>
+                      style={{ background:'var(--bg-elevated)', borderColor: selectedItem?.idx === i && selectedItem?.type === 'event' ? 'rgba(59,130,246,0.4)' : 'var(--border)' }}>
                       <div className="font-semibold truncate" style={{ color:'var(--text-primary)' }}>{item.name || item.event_type}</div>
                       <div className="flex items-center justify-between mt-0.5">
                         <span style={{ color:'var(--text-secondary)' }}>{item.event_type}</span>
@@ -462,13 +538,30 @@ export default function CityMap() {
           </Panel>
         </div>
 
-        {/* Map + detail panel */}
+        {/* ── Map + detail ── */}
         <div className="lg:col-span-3 space-y-3">
           <div className="relative w-full rounded-xl overflow-hidden border" style={{ height:540, background:'var(--bg-card)', borderColor:'var(--border)' }}>
             <div ref={mapRef} className="absolute inset-0" />
+
+            {/* Loading spinner */}
             {loading && (
-              <div className="absolute inset-0 flex items-center justify-center" style={{ background:'var(--bg-card)' }}>
+              <div className="absolute inset-0 flex items-center justify-center z-20" style={{ background:'var(--bg-card)' }}>
                 <Spinner />
+              </div>
+            )}
+
+            {/* Empty state overlay — only when map has no markers at all */}
+            {!loading && liveViewEmpty && (
+              <EmptyMapOverlay view={view} hasKey={hasKey} />
+            )}
+
+            {/* Data source chip */}
+            {!loading && mode === 'live' && (
+              <div className="absolute bottom-3 left-3 z-10 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-mono"
+                style={{ background:'rgba(0,0,0,0.7)', color: hasKey ? '#10B981' : '#EF4444', backdropFilter:'blur(4px)' }}>
+                <div className="w-1.5 h-1.5 rounded-full" style={{ background: hasKey ? '#10B981' : '#EF4444' }} />
+                {hasKey ? 'TomTom Live' : 'No API Key'}
+                {lastUpdate && <span style={{ color:'rgba(255,255,255,0.4)' }}> · {lastUpdate}</span>}
               </div>
             )}
           </div>
@@ -478,51 +571,73 @@ export default function CityMap() {
             <Panel>
               <PanelHeader
                 title={selectedItem.type === 'incident' ? '🚨 Incident Detail' : selectedItem.type === 'traffic' ? '🛣 Corridor Detail' : '📍 Event Detail'}
-                badge={selectedItem.type === 'incident' ? selectedItem.data.severity : selectedItem.type === 'traffic' ? `${selectedItem.data.congestion_pct}% congested` : selectedItem.data.risk_level}
-                badgeColor={selectedItem.data.severity === 'Critical' || selectedItem.data.risk_level === 'High' || selectedItem.data.congestion_pct > 70 ? 'red' : 'amber'}>
-                <button onClick={() => setSelectedItem(null)} className="text-xs cursor-pointer px-2 py-0.5 rounded" style={{ color:'var(--text-muted)', background:'var(--bg-elevated)' }}>✕ Close</button>
+                badge={
+                  selectedItem.type === 'incident' ? (selectedItem.data.severity || 'Unknown')
+                  : selectedItem.type === 'traffic' ? `${selectedItem.data.congestion_pct}% congested`
+                  : selectedItem.data.risk_level
+                }
+                badgeColor={
+                  selectedItem.data.severity === 'Critical' || selectedItem.data.risk_level === 'High'
+                  || selectedItem.data.congestion_pct > 70 ? 'red' : 'amber'
+                }>
+                <button onClick={() => setSelectedItem(null)} className="text-xs cursor-pointer px-2 py-0.5 rounded"
+                  style={{ color:'var(--text-muted)', background:'var(--bg-elevated)' }}>✕ Close</button>
               </PanelHeader>
               <div className="p-4 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                {selectedItem.type === 'incident' && (<>
-                  {[['Cause',selectedItem.data.cause],['Severity',selectedItem.data.severity],['Road',selectedItem.data.road],['Source',selectedItem.data.source],
-                    ['Delay',selectedItem.data.delay_sec > 0 ? `${Math.round(selectedItem.data.delay_sec/60)} min` : 'Unknown'],
-                    ['Length',selectedItem.data.length_m > 0 ? `${selectedItem.data.length_m}m` : 'Unknown'],
-                    ['From',selectedItem.data.from||'—'],['Updated', new Date(selectedItem.data.timestamp).toLocaleTimeString()]
+                {selectedItem.type === 'incident' && (
+                  [
+                    ['Cause',    selectedItem.data.cause || '—'],
+                    ['Severity', selectedItem.data.severity || 'Unknown'],
+                    ['Road',     selectedItem.data.road || selectedItem.data.from || '—'],
+                    ['Source',   selectedItem.data.source || '—'],
+                    ['Delay',    safeDelay(selectedItem.data.delay_sec)],
+                    ['Length',   selectedItem.data.length_m > 0 ? `${selectedItem.data.length_m}m` : '—'],
+                    ['From',     selectedItem.data.from || '—'],
+                    ['Updated',  safeTime(selectedItem.data.timestamp)],
                   ].map(([l,v]) => (
                     <div key={l} className="p-2 rounded-lg" style={{ background:'var(--bg-elevated)' }}>
                       <div style={{ color:'var(--text-muted)' }}>{l}</div>
                       <div className="font-semibold mt-0.5 truncate" style={{ color:'var(--text-primary)' }}>{v}</div>
                     </div>
-                  ))}
-                </>)}
-                {selectedItem.type === 'traffic' && (<>
-                  {[['Corridor',selectedItem.data.corridor],['Congestion',`${selectedItem.data.congestion_pct}%`],
-                    ['Level',selectedItem.data.congestion_level],['Normal Travel',`${selectedItem.data.duration_normal_min} min`],
-                    ['With Traffic',`${selectedItem.data.duration_traffic_min} min`],['Extra Delay',`+${selectedItem.data.delay_min} min`],
-                    ['Distance',`${selectedItem.data.distance_km} km`],['Source',selectedItem.data.source],
+                  ))
+                )}
+                {selectedItem.type === 'traffic' && (
+                  [
+                    ['Corridor',      selectedItem.data.corridor],
+                    ['Congestion',    `${selectedItem.data.congestion_pct}%`],
+                    ['Level',         selectedItem.data.congestion_level],
+                    ['Normal Travel', `${selectedItem.data.duration_normal_min} min`],
+                    ['With Traffic',  `${selectedItem.data.duration_traffic_min} min`],
+                    ['Extra Delay',   `+${selectedItem.data.delay_min} min`],
+                    ['Distance',      `${selectedItem.data.distance_km} km`],
+                    ['Source',        selectedItem.data.source],
                   ].map(([l,v]) => (
                     <div key={l} className="p-2 rounded-lg" style={{ background:'var(--bg-elevated)' }}>
                       <div style={{ color:'var(--text-muted)' }}>{l}</div>
                       <div className="font-semibold mt-0.5 truncate" style={{ color:'var(--text-primary)' }}>{v}</div>
                     </div>
-                  ))}
-                </>)}
-                {selectedItem.type === 'event' && (<>
-                  {[['Name',selectedItem.data.name||selectedItem.data.event_type],['Type',selectedItem.data.event_type],
-                    ['Crowd Est.',`~${(selectedItem.data.crowd_estimate||0).toLocaleString()}`],['Risk Level',selectedItem.data.risk_level],
-                    ['Source',selectedItem.data.source],['Updated', new Date(selectedItem.data.timestamp).toLocaleTimeString()],
+                  ))
+                )}
+                {selectedItem.type === 'event' && (
+                  [
+                    ['Name',       selectedItem.data.name || selectedItem.data.event_type],
+                    ['Type',       selectedItem.data.event_type],
+                    ['Crowd Est.', `~${(selectedItem.data.crowd_estimate||0).toLocaleString()}`],
+                    ['Risk Level', selectedItem.data.risk_level],
+                    ['Source',     selectedItem.data.source],
+                    ['Updated',    safeTime(selectedItem.data.timestamp)],
                   ].map(([l,v]) => (
                     <div key={l} className="p-2 rounded-lg" style={{ background:'var(--bg-elevated)' }}>
                       <div style={{ color:'var(--text-muted)' }}>{l}</div>
                       <div className="font-semibold mt-0.5 truncate" style={{ color:'var(--text-primary)' }}>{v}</div>
                     </div>
-                  ))}
-                </>)}
+                  ))
+                )}
               </div>
             </Panel>
           )}
 
-          {/* Corridor traffic table (live traffic view) */}
+          {/* Corridor traffic table */}
           {mode === 'live' && view === 'traffic' && liveTraffic.length > 0 && (
             <Panel>
               <PanelHeader title="All Corridor Status" badge={`${liveTraffic.length} corridors`} badgeColor="blue" />
@@ -539,7 +654,7 @@ export default function CityMap() {
                     {[...liveTraffic].sort((a,b) => b.congestion_pct - a.congestion_pct).map((t,i) => {
                       const color = CONGESTION_COLOR(t.congestion_pct)
                       return (
-                        <tr key={i} onClick={() => setSelectedItem({ type:'traffic', data:t })}
+                        <tr key={i} onClick={() => setSelectedItem({ type:'traffic', idx:i, data:t })}
                           className="border-b cursor-pointer hover:bg-white/[0.02] transition-colors"
                           style={{ borderColor:'rgba(59,130,246,0.05)' }}>
                           <td className="px-4 py-2 text-xs font-semibold" style={{ color:'var(--text-primary)' }}>{t.corridor}</td>
