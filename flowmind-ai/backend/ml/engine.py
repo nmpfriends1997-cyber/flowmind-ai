@@ -587,9 +587,12 @@ def _hourly_forecast_ml(models: dict, event_cause: str, time_of_day: str,
     preds_rfr = rfr.predict(X_hours)
     preds = preds_gbr * 0.6 + preds_rfr * 0.4
 
-    # Scale so the peak aligns with our final congestion score
+    # Shift so the quietest hour is 0, then scale so the peak equals peak_congestion.
+    # Without the shift, all hours inherit the model's non-zero baseline and the
+    # chart never touches 0 even at 3am — which looks wrong to the user.
+    preds = preds - preds.min()          # quietest hour → 0
     if preds.max() > 0:
-        preds = preds / preds.max() * peak_congestion
+        preds = preds / preds.max() * peak_congestion   # peak hour → peak_congestion
 
     preds = np.clip(preds, 0, 99)
     return [{"hour": int(h), "congestion": round(float(c), 1)} for h, c in enumerate(preds)]
