@@ -10,12 +10,14 @@ router = APIRouter()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Free models in priority order — if first fails, next is tried automatically
+# Updated free models list — June 2026 verified working on OpenRouter
 FREE_MODELS = [
     "deepseek/deepseek-r1:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-3-27b-it:free",
-    "mistralai/mistral-7b-instruct:free",
+    "nvidia/llama-3.1-nemotron-70b-instruct:free",
+    "qwen/qwen3-235b-a22b:free",
+    "google/gemma-3-12b-it:free",
+    "openai/gpt-5.4-nano:free",
 ]
 
 
@@ -123,8 +125,7 @@ class ChatRequest(BaseModel):
     history: list = []
 
 
-async def call_openrouter(messages: list, model: str) -> dict:
-    """Call OpenRouter with a specific model and return the raw response data."""
+async def call_model(messages: list, model: str) -> dict:
     payload = {
         "model": model,
         "messages": messages,
@@ -164,22 +165,28 @@ async def chat(req: ChatRequest):
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": req.message})
 
-    # Try each free model in order until one works
-    last_error = ""
+    # Try each free model in order until one succeeds
+    errors = []
     for model in FREE_MODELS:
         try:
-            data = await call_openrouter(messages, model)
+            data = await call_model(messages, model)
 
             if "choices" in data and data["choices"]:
                 reply = data["choices"][0]["message"]["content"]
                 return {"reply": reply}
 
-            # Provider error — try next model
-            last_error = data.get("error", {}).get("message", str(data)) if "error" in data else str(data)
+            err = data.get("error", {}).get("message", str(data)) if "error" in data else str(data)
+            errors.append(f"{model}: {err}")
 
         except Exception as e:
-            last_error = str(e)
-            continue  # try next model
+            errors.append(f"{model}: {str(e)}")
+            continue
 
-    # All models failed
-    return {"reply": f"⚠️ All models unavailable. Last error: {last_error}"}
+    # All models failed — tell user to check openrouter.ai/models for current free models
+    return {
+        "reply": (
+            "⚠️ All free models are currently unavailable on OpenRouter.\n\n"
+            "Please check https://openrouter.ai/models — filter by 'Free' to see what's currently working.\n"
+            "Then update FREE_MODELS list in assistant.py with a working model ID ending in :free."
+        )
+    }
