@@ -79,11 +79,15 @@ OVERPASS_QUERY = """
 out body 80;
 """
 
-async def fetch_osm_venues() -> list:
+async def _fetch_osm_venues_inner() -> list:
     last_error = None
     for url in OVERPASS_URLS:
         try:
-            async with httpx.AsyncClient(timeout=12) as client:
+            # 4s per mirror (not 12s) — with 4 mirrors that's a 16s worst case
+            # on its own, which is why this whole function is additionally
+            # wrapped in an 8s hard budget below; this per-call timeout just
+            # keeps any single slow mirror from eating the entire budget.
+            async with httpx.AsyncClient(timeout=4) as client:
                 client.headers["User-Agent"] = "FlowMindAI/1.0 (Bengaluru traffic; flowmind-ai@example.com)"
                 # Actually remove (not just blank-out — httpx rejects None as a
                 # header value) the Accept/Accept-Encoding headers httpx adds
@@ -143,6 +147,23 @@ async def fetch_osm_venues() -> list:
 
     logger.warning("All Overpass endpoints failed (%s) — no live venue data this cycle.", last_error)
     return []
+
+
+async def fetch_osm_venues() -> list:
+    """
+    Wraps the mirror-retry loop in a hard 8s overall budget. Without this,
+    4 mirrors x 12s timeout each could take up to 48s in the worst case
+    (all mirrors slow/down) — well past the frontend's 15s axios timeout on
+    /api/live/live-snapshot, which is what was causing the Live Map to load
+    with no markers (the request simply timed out client-side before the
+    backend ever responded). If the budget is exceeded we just return an
+    empty venue list for this cycle rather than blocking the whole snapshot.
+    """
+    try:
+        return await asyncio.wait_for(_fetch_osm_venues_inner(), timeout=8)
+    except asyncio.TimeoutError:
+        logger.warning("Overpass venue fetch exceeded its 8s budget — skipping venues for this cycle.")
+        return []
 
 # ── TomTom Traffic Incidents ──────────────────────────────────────────────────
 async def fetch_tomtom_incidents() -> list:
