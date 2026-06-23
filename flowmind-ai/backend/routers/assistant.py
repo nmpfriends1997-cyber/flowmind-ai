@@ -6,10 +6,10 @@ from ml.engine import get_summary_stats, get_zone_risk, get_cause_distribution, 
 
 router = APIRouter()
 
-# ── Get your FREE Groq API key at: https://console.groq.com ──
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"  # Free, fast, very capable
+# ── Get your FREE OpenRouter API key at: https://openrouter.ai ──
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"  # 100% free model
 
 
 def get_bangalore_time_context() -> str:
@@ -118,25 +118,24 @@ class ChatRequest(BaseModel):
 
 @router.post("/chat")
 async def chat(req: ChatRequest):
-    if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
+    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.startswith("your_"):
         return {
             "reply": (
-                "⚠️ Groq API key not set.\n"
-                "Get your FREE key at: https://console.groq.com\n"
-                "Then add GROQ_API_KEY=your_key to your backend/.env file."
+                "⚠️ OpenRouter API key not set.\n"
+                "Get your FREE key at: https://openrouter.ai\n"
+                "Then add OPENROUTER_API_KEY=your_key to your backend/.env file."
             )
         }
 
     system_prompt = build_system_prompt()
 
-    # Groq uses OpenAI-compatible format
     messages = [{"role": "system", "content": system_prompt}]
     for h in req.history[-6:]:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": req.message})
 
     payload = {
-        "model": GROQ_MODEL,
+        "model": OPENROUTER_MODEL,
         "messages": messages,
         "max_tokens": 512,
         "temperature": 0.4,
@@ -146,10 +145,12 @@ async def chat(req: ChatRequest):
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                GROQ_URL,
+                OPENROUTER_URL,
                 headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
+                    "HTTP-Referer": "https://flowmind-ai.app",
+                    "X-Title": "FlowMind AI",
                 },
                 json=payload,
             )
@@ -159,10 +160,10 @@ async def chat(req: ChatRequest):
         if "choices" in data and data["choices"]:
             reply = data["choices"][0]["message"]["content"]
         elif "error" in data:
-            err = data["error"].get("message", "Unknown error")
-            reply = f"⚠️ Groq API error: {err}"
+            err = data["error"].get("message", str(data["error"]))
+            reply = f"⚠️ OpenRouter error: {err}"
         else:
-            reply = f"⚠️ Unexpected response. Raw: {data}"
+            reply = f"⚠️ Unexpected response: {data}"
 
         return {"reply": reply}
 
