@@ -59,10 +59,10 @@ def np_clip(v, lo, hi):
 # so we explicitly null them out below. We also try several mirrors in order
 # before giving up, since any single free instance can be down at any time.
 OVERPASS_URLS = [
+    "https://overpass.osm.ch/api/interpreter",
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
-    "https://overpass.osm.ch/api/interpreter",
 ]
 OVERPASS_QUERY = """
 [out:json][timeout:25];
@@ -160,9 +160,9 @@ async def fetch_osm_venues() -> list:
     empty venue list for this cycle rather than blocking the whole snapshot.
     """
     try:
-        return await asyncio.wait_for(_fetch_osm_venues_inner(), timeout=8)
+        return await asyncio.wait_for(_fetch_osm_venues_inner(), timeout=10)
     except asyncio.TimeoutError:
-        logger.warning("Overpass venue fetch exceeded its 8s budget — skipping venues for this cycle.")
+        logger.warning("Overpass venue fetch exceeded its 10s budget — skipping venues for this cycle.")
         return []
 
 # ── TomTom Traffic Incidents ──────────────────────────────────────────────────
